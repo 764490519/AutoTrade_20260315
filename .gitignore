@@ -1,0 +1,19 @@
+﻿__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+.venv/
+venv/
+.env
+.env.*
+
+# Streamlit/cache/log artifacts
+.streamlit/
+reports/
+
+# OS/IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
