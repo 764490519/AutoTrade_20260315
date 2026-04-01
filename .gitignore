@@ -7,10 +7,13 @@
 venv/
 .env
 .env.*
+config/apis.toml
+**/config/apis.toml
 
 # Streamlit/cache/log artifacts
 .streamlit/
 reports/
+**/reports/
 
 # OS/IDE
 .DS_Store

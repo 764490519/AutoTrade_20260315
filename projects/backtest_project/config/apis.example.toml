@@ -1,0 +1,28 @@
+# API 配置示例（复制为 apis.toml 后填写真实值）
+
+[okx]
+api_key = ""
+api_secret = ""
+api_passphrase = ""
+base_url = "https://www.okx.com"
+demo_trading = true
+timeout = 10
+
+[binance]
+# 当前历史 K 线接口为公共 API，不需要 key
+api_key = ""
+api_secret = ""
+base_url = "https://api.binance.com"
+
+[email]
+# 开/平仓邮件通知（可选）
+enabled = false
+smtp_host = "smtp.qq.com"
+smtp_port = 465
+smtp_user = "your_mail@qq.com"
+smtp_password = "your_smtp_auth_code"
+sender = "your_mail@qq.com"
+recipients = ["receiver1@example.com"]
+use_ssl = true
+use_starttls = false
+subject_prefix = "[AutoTrade]"

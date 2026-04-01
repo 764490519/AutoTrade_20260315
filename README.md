@@ -15,6 +15,9 @@
 - 一键参数优化（网格搜索）+ Walk-Forward 报告（可下载 CSV）
 - 支持 Optuna 贝叶斯优化（TPE/CMA-ES/随机）+ Walk-Forward 报告
 - 每次回测自动记录配置与结果（周期、币种、策略、参数、资金参数、核心指标）
+- OKX 交易模块（查询持仓、查询余额、策略信号自动开平仓）
+- 开仓/平仓邮件通知（可选）
+- 策略实时执行模块（实时K线 + 策略信号自动开平仓）
 
 ## 策略文件规范
 
@@ -61,6 +64,11 @@ streamlit run app.py
 
 浏览器打开后，在左侧选择/编辑策略文件，点击“开始回测”。
 
+侧边栏新增「工作台」切换：
+
+- 回测与优化
+- 策略自动交易
+
 参数优化入口：
 
 - 左侧「参数优化」区域点击 `一键参数优化 + Walk-Forward`
@@ -74,9 +82,15 @@ streamlit run app.py
 - `app.py`：Streamlit UI
 - `binance_data.py`：币安历史 K 线获取
 - `backtest_engine.py`：回测执行与指标统计
+- `api_config.py`：统一 API 配置文件读取
+- `live_trading_engine.py`：策略实时信号执行引擎（单次执行/自动轮询）
+- `config/apis.example.toml`：API 配置模板
+- `config/apis.toml`：本地 API 配置（不入库）
 - `strategy_files/`：策略文件目录
 - `reports/backtest_run_history.csv`：回测历史汇总日志
 - `reports/backtest_runs/*.json`：单次回测详细记录
+- `reports/operation_logs.csv`：OKX 操作日志汇总
+- `reports/operation_log_details/*.json`：OKX 单次操作详细日志
 
 ## 说明
 
@@ -84,3 +98,65 @@ streamlit run app.py
 - 若请求频率过高可能触发限流，建议缩小时间范围或稍后重试。
 - 策略代码通过 `exec` 动态加载，请仅运行可信本地代码。
 - 本项目用于策略研究演示，不构成投资建议。
+
+## OKX API 配置（实盘交易模块）
+
+推荐使用 `config/apis.toml` 集中管理 API 配置：
+
+1) 复制模板：
+
+```bash
+cp config/apis.example.toml config/apis.toml
+```
+
+2) 填写真实值（示例）：
+
+```toml
+[okx]
+api_key = "xxx"
+api_secret = "xxx"
+api_passphrase = "xxx"
+base_url = "https://www.okx.com"
+demo_trading = true
+timeout = 10
+```
+
+也支持环境变量或 `.streamlit/secrets.toml`，字段如下：
+
+- `OKX_API_KEY`
+- `OKX_API_SECRET`
+- `OKX_API_PASSPHRASE`
+- `OKX_DEMO_TRADING`（可选，`1/true` 表示模拟盘）
+- `OKX_BASE_URL`（可选，默认 `https://www.okx.com`）
+
+### 邮件通知配置（开仓/平仓）
+
+同样在 `config/apis.toml` 增加：
+
+```toml
+[email]
+enabled = true
+smtp_host = "smtp.qq.com"
+smtp_port = 465
+smtp_user = "your_mail@qq.com"
+smtp_password = "smtp授权码"
+sender = "your_mail@qq.com"
+recipients = ["a@example.com", "b@example.com"]
+use_ssl = true
+use_starttls = false
+subject_prefix = "[AutoTrade]"
+```
+
+说明：
+- `enabled=false` 时不发通知
+- 支持从环境变量读取：`SMTP_HOST/SMTP_PORT/SMTP_USER/SMTP_PASSWORD/SMTP_SENDER/SMTP_RECIPIENTS`
+
+## 策略实时执行（重要）
+
+在 OKX 交易模块中可使用：
+
+- `执行一次策略信号`：拉取最新已收盘K线，运行当前策略，并按信号执行开平仓
+- `启动自动执行`：后台按轮询秒数执行（可选“仅新K线执行”）
+- `停止自动执行`：停止后台任务
+
+建议先在 `demo_trading=true` 模拟盘验证，再切换实盘。

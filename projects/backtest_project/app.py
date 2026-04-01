@@ -39,9 +39,8 @@ from live_trading_engine import (
 from okx_trading import OKXClient, OKXConfig
 
 
-MODE_LOCK = str(os.getenv("AUTOTRADE_MODE_LOCK", "")).strip().lower()
-if MODE_LOCK not in {"backtest", "live"}:
-    MODE_LOCK = ""
+# 物理解耦：回测项目固定为 backtest 模式
+MODE_LOCK = "backtest"
 
 st.set_page_config(page_title="Backtrader + Binance 交易系统", layout="wide")
 if MODE_LOCK == "live":
@@ -111,9 +110,9 @@ PERSIST_STATE_KEYS = {
     "live_symbol_select",
     "live_symbol_custom",
     "live_interval",
+    "live_okx_inst_id",
     "live_okx_inst_type",
     "live_td_mode",
-    "live_leverage",
     "live_pos_side",
     "live_order_size",
     "live_poll_seconds",
@@ -137,18 +136,6 @@ COMMON_MARKET_SYMBOLS = [
     "LTCUSDT",
     "AVAXUSDT",
 ]
-OKX_SYMBOL_QUOTE_SUFFIXES = (
-    "USDT",
-    "USDC",
-    "BUSD",
-    "FDUSD",
-    "TUSD",
-    "DAI",
-    "BTC",
-    "ETH",
-    "USD",
-    "EUR",
-)
 
 NEW_STRATEGY_TEMPLATE = """import backtrader as bt
 
@@ -330,31 +317,6 @@ def _normalize_market_symbol(value: Any) -> str:
     # 兼容 BTC/USDT、BTC-USDT、BTC_USDT 等写法
     text = re.sub(r"[^A-Z0-9]", "", text)
     return text
-
-
-def _split_market_symbol_base_quote(value: Any) -> tuple[str, str] | None:
-    symbol = _normalize_market_symbol(value)
-    if not symbol:
-        return None
-    for quote in OKX_SYMBOL_QUOTE_SUFFIXES:
-        if symbol.endswith(quote) and len(symbol) > len(quote):
-            base = symbol[: -len(quote)]
-            if base:
-                return base, quote
-    return None
-
-
-def _build_okx_inst_id_from_symbol(value: Any, inst_type: Any) -> str | None:
-    parsed = _split_market_symbol_base_quote(value)
-    if parsed is None:
-        return None
-    base, quote = parsed
-    inst_type_text = str(inst_type or "").upper().strip()
-    if inst_type_text == "SPOT":
-        return f"{base}-{quote}"
-    if inst_type_text == "SWAP":
-        return f"{base}-{quote}-SWAP"
-    return None
 
 
 def _to_serializable(value: Any) -> Any:
@@ -901,14 +863,12 @@ def _render_okx_trading_panel() -> None:
         st.session_state["live_symbol_custom"] = st.session_state["live_market_symbol"]
     if "live_interval" not in st.session_state:
         st.session_state["live_interval"] = "1m"
+    if "live_okx_inst_id" not in st.session_state:
+        st.session_state["live_okx_inst_id"] = "BTC-USDT-SWAP"
     if "live_okx_inst_type" not in st.session_state:
-        st.session_state["live_okx_inst_type"] = "SWAP"
-    if str(st.session_state.get("live_okx_inst_type", "SWAP")).upper().strip() not in {"SPOT", "SWAP"}:
         st.session_state["live_okx_inst_type"] = "SWAP"
     if "live_td_mode" not in st.session_state:
         st.session_state["live_td_mode"] = "cross"
-    if "live_leverage" not in st.session_state:
-        st.session_state["live_leverage"] = "5"
     if "live_pos_side" not in st.session_state:
         st.session_state["live_pos_side"] = "net"
     if "live_order_size" not in st.session_state:
@@ -968,39 +928,17 @@ def _render_okx_trading_panel() -> None:
         st.selectbox("实时K线周期", ["1m", "5m", "15m", "1h", "4h", "1d"], key="live_interval")
         st.number_input("历史K线窗口", min_value=60, max_value=1000, step=10, key="live_lookback_bars")
     with live_col2:
-        st.selectbox(
-            "实盘类型(instType)",
-            ["SPOT", "SWAP"],
-            key="live_okx_inst_type",
-            format_func=lambda x: "现货 (SPOT)" if x == "SPOT" else "合约 (SWAP)",
-        )
-        if str(st.session_state.get("live_okx_inst_type", "SWAP")).upper().strip() == "SPOT":
-            st.session_state["live_td_mode"] = "cash"
-            st.selectbox("实盘交易模式(tdMode)", ["cash"], key="live_td_mode")
-            st.caption("现货模式自动使用 cash，不执行做空。")
-        else:
-            if str(st.session_state.get("live_td_mode", "cross")).strip() not in {"cross", "isolated"}:
-                st.session_state["live_td_mode"] = "cross"
-            st.selectbox("实盘交易模式(tdMode)", ["cross", "isolated"], key="live_td_mode")
-            st.text_input("合约杠杆倍数(lever)", key="live_leverage", placeholder="例如 3 / 5 / 10")
+        st.text_input("实盘标的(instId)", key="live_okx_inst_id")
+        st.selectbox("实盘产品类型(instType)", ["SPOT", "MARGIN", "SWAP", "FUTURES", "OPTION"], key="live_okx_inst_type")
+        st.selectbox("实盘交易模式(tdMode)", ["cash", "cross", "isolated"], key="live_td_mode")
     with live_col3:
         st.text_input("实盘下单数量(sz)", key="live_order_size")
-        st.selectbox(
-            "实盘持仓方向(posSide)",
-            ["net", "long", "short", ""],
-            key="live_pos_side",
-            format_func=lambda x: "默认" if x == "" else x,
-            disabled=str(st.session_state.get("live_okx_inst_type", "SWAP")).upper().strip() == "SPOT",
-            help="现货模式下不使用该参数。",
-        )
+        st.selectbox("实盘持仓方向(posSide)", ["net", "long", "short", ""], key="live_pos_side", format_func=lambda x: "默认" if x == "" else x)
         st.number_input("轮询秒数", min_value=2, max_value=3600, step=1, key="live_poll_seconds")
 
     st.checkbox("仅在新K线出现时执行", key="live_only_new_bar")
     st.checkbox("信号为FLAT时自动平仓", key="live_close_on_flat")
-    live_is_spot = str(st.session_state.get("live_okx_inst_type", "SWAP")).upper().strip() == "SPOT"
-    if live_is_spot:
-        st.session_state["live_allow_short"] = False
-    st.checkbox("允许做空信号执行", key="live_allow_short", disabled=live_is_spot, help="现货模式下自动禁用")
+    st.checkbox("允许做空信号执行", key="live_allow_short")
     st.checkbox("我确认启用策略自动交易", key="live_confirm_trade")
 
     once_btn, start_btn, stop_btn = st.columns(3)
@@ -1009,43 +947,19 @@ def _render_okx_trading_panel() -> None:
     stop_live = stop_btn.button("停止自动执行", use_container_width=True, key="live_stop")
 
     live_cfg = None
-    live_market_symbol = _normalize_market_symbol(st.session_state.get("live_market_symbol", "BTCUSDT")) or "BTCUSDT"
-    live_inst_type = str(st.session_state.get("live_okx_inst_type", "SWAP")).upper().strip()
-    derived_live_okx_inst_id = _build_okx_inst_id_from_symbol(live_market_symbol, live_inst_type)
-    live_leverage_text = str(st.session_state.get("live_leverage", "")).strip()
-    live_leverage_value: str | None = None
-    if live_inst_type == "SWAP":
-        if not live_leverage_text:
-            st.error("合约模式请填写杠杆倍数。")
-        else:
-            try:
-                leverage_float = float(live_leverage_text)
-            except Exception:  # noqa: BLE001
-                st.error("杠杆倍数格式错误，请输入数字。")
-            else:
-                if leverage_float <= 0:
-                    st.error("杠杆倍数必须大于 0。")
-                else:
-                    live_leverage_value = live_leverage_text
-    if derived_live_okx_inst_id:
-        st.caption(f"自动映射的 OKX 标的：`{derived_live_okx_inst_id}`")
-    else:
-        st.error("当前交易对无法自动映射为 OKX 标的，请检查交易对格式（例如 BTCUSDT）。")
-
     if live_strategy_cls is not None:
         live_cfg = LiveTradingConfig(
-            market_symbol=live_market_symbol,
+            market_symbol=_normalize_market_symbol(st.session_state.get("live_market_symbol", "BTCUSDT")) or "BTCUSDT",
             interval=str(st.session_state.get("live_interval", "1m")).strip(),
             lookback_bars=int(st.session_state.get("live_lookback_bars", 500)),
             poll_seconds=int(st.session_state.get("live_poll_seconds", 10)),
             only_new_bar=bool(st.session_state.get("live_only_new_bar", True)),
             close_on_flat=bool(st.session_state.get("live_close_on_flat", True)),
-            allow_short=(False if live_is_spot else bool(st.session_state.get("live_allow_short", True))),
-            okx_inst_id=derived_live_okx_inst_id or "",
-            okx_inst_type=live_inst_type,
-            okx_td_mode=("cash" if live_is_spot else str(st.session_state.get("live_td_mode", "cross")).strip()),
-            okx_pos_side=("" if live_is_spot else (str(st.session_state.get("live_pos_side", "net")).strip() or "net")),
-            okx_leverage=(None if live_is_spot else live_leverage_value),
+            allow_short=bool(st.session_state.get("live_allow_short", True)),
+            okx_inst_id=str(st.session_state.get("live_okx_inst_id", "")).strip(),
+            okx_inst_type=str(st.session_state.get("live_okx_inst_type", "SWAP")).strip(),
+            okx_td_mode=str(st.session_state.get("live_td_mode", "cross")).strip(),
+            okx_pos_side=(str(st.session_state.get("live_pos_side", "net")).strip() or "net"),
             okx_ccy=(str(st.session_state.get("okx_ccy", "")).strip() or None),
             order_size=str(st.session_state.get("live_order_size", "0.01")).strip(),
             strategy_params=live_strategy_params,
@@ -1057,10 +971,6 @@ def _render_okx_trading_panel() -> None:
             st.error("策略不可用，无法执行")
         elif not bool(st.session_state.get("live_confirm_trade", False)):
             st.error("请先勾选“我确认启用策略自动交易”")
-        elif not live_cfg.okx_inst_id:
-            st.error("交易对无法映射为 OKX 标的，请检查交易对格式（例如 BTCUSDT）。")
-        elif live_inst_type == "SWAP" and not live_cfg.okx_leverage:
-            st.error("合约模式下杠杆倍数无效，请检查输入。")
         else:
             live_result = execute_signal_once(
                 client=client,
@@ -1072,7 +982,6 @@ def _render_okx_trading_panel() -> None:
                 "instType": live_cfg.okx_inst_type,
                 "tdMode": live_cfg.okx_td_mode,
                 "posSide": live_cfg.okx_pos_side,
-                "lever": live_cfg.okx_leverage,
                 "sz": live_cfg.order_size,
                 "market_symbol": live_cfg.market_symbol,
                 "interval": live_cfg.interval,
@@ -1134,9 +1043,7 @@ def _render_okx_trading_panel() -> None:
         elif not bool(st.session_state.get("live_confirm_trade", False)):
             st.error("请先勾选“我确认启用策略自动交易”")
         elif not live_cfg.okx_inst_id:
-            st.error("交易对无法映射为 OKX 标的，请检查交易对格式（例如 BTCUSDT）。")
-        elif live_inst_type == "SWAP" and not live_cfg.okx_leverage:
-            st.error("合约模式下杠杆倍数无效，请检查输入。")
+            st.error("请填写实盘标的(instId)")
         else:
             start_live_worker(
                 key=LIVE_WORKER_KEY,

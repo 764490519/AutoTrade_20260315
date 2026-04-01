@@ -39,9 +39,8 @@ from live_trading_engine import (
 from okx_trading import OKXClient, OKXConfig
 
 
-MODE_LOCK = str(os.getenv("AUTOTRADE_MODE_LOCK", "")).strip().lower()
-if MODE_LOCK not in {"backtest", "live"}:
-    MODE_LOCK = ""
+# 物理解耦：实盘项目固定为 live 模式
+MODE_LOCK = "live"
 
 st.set_page_config(page_title="Backtrader + Binance 交易系统", layout="wide")
 if MODE_LOCK == "live":
