@@ -7,8 +7,15 @@ import backtrader as bt
 import pandas as pd
 
 
-class FractionalCryptoCommissionInfo(bt.CommInfoBase):
-    """支持数字货币小数下单的手续费模型。"""
+class LeverageCryptoCommissionInfo(bt.CommInfoBase):
+    """
+    支持杠杆与小数下单的手续费模型（股票风格估值 + 杠杆现金占用）。
+
+    设计目标：
+    - 杠杆参数真正影响头寸敞口
+    - 支持小数仓位（数字货币）
+    - 通过 BackBroker 内置杠杆现金逻辑 + 自定义Sizer实现杠杆生效
+    """
 
     params = (
         ("commission", 0.001),
@@ -22,14 +29,44 @@ class FractionalCryptoCommissionInfo(bt.CommInfoBase):
         if price <= 0:
             return 0.0
         cash = float(cash)
-        price = float(price)
 
-        # 为买入预留手续费，避免 100% 目标仓位因佣金导致 Margin 拒单
+        # 为下单预留手续费，避免保证金边界触发拒单
         fee_factor = 1.0 + float(self.p.commission or 0.0)
         if fee_factor <= 0:
             fee_factor = 1.0
 
-        return float(self.p.leverage) * cash / (price * fee_factor)
+        return float(self.p.leverage) * cash / (float(price) * fee_factor)
+
+
+class TargetPercentLeverageSizer(bt.Sizer):
+    """
+    目标保证金占比 + 杠杆仓位Sizer
+
+    规则：
+    - 保证金使用 = 现金 * percents%
+    - 名义敞口 = 保证金使用 * leverage
+    - 下单数量 = 名义敞口 / 价格
+    """
+
+    params = (
+        ("percents", 95.0),
+        ("leverage", 1.0),
+    )
+
+    def _getsizing(self, comminfo, cash, data, isbuy):  # noqa: ARG002
+        price = float(data.close[0] or 0.0)
+        if price <= 0:
+            return 0.0
+
+        perc = max(0.0, min(100.0, float(self.p.percents or 0.0)))
+        lev = max(1e-12, float(self.p.leverage or 1.0))
+        fee_factor = 1.0 + float(getattr(comminfo.p, "commission", 0.0) or 0.0)
+        if fee_factor <= 0:
+            fee_factor = 1.0
+
+        notional = float(cash) * (perc / 100.0) * lev
+        size = notional / (price * fee_factor)
+        return max(0.0, float(size))
 
 
 class EquityCurveAnalyzer(bt.Analyzer):
@@ -137,10 +174,14 @@ def run_backtest(
     cerebro.adddata(data)
     cerebro.addstrategy(strategy_cls, **strategy_params)
 
+    position_percent = float(position_percent)
+    if position_percent <= 0:
+        raise ValueError("position_percent 必须大于 0")
+
     cerebro.broker.setcash(initial_cash)
-    comminfo = FractionalCryptoCommissionInfo(commission=commission, leverage=leverage)
+    comminfo = LeverageCryptoCommissionInfo(commission=commission, leverage=leverage)
     cerebro.broker.addcommissioninfo(comminfo)
-    cerebro.addsizer(bt.sizers.PercentSizer, percents=position_percent)
+    cerebro.addsizer(TargetPercentLeverageSizer, percents=position_percent, leverage=leverage)
 
     # 使用日收益计算 Sharpe，避免默认 Years 仅少量样本导致异常放大
     # Binance 为 7x24 市场，年化因子按 365
