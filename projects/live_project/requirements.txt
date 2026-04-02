@@ -4,3 +4,4 @@ requests>=2.31.0
 streamlit>=1.34.0
 plotly>=5.22.0
 optuna>=3.6.1
+vectorbt>=0.26.0
