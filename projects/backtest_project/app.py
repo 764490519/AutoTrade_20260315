@@ -1,6 +1,5 @@
 ﻿from __future__ import annotations
 
-import inspect
 import json
 import traceback
 import hashlib
@@ -14,13 +13,12 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-import backtrader as bt
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
 from backtest_engine import run_backtest
-from binance_data import BinanceDataError, fetch_klines
+from binance_data import BinanceDataError, INTERVAL_TO_MS, fetch_klines
 from optimization_engine import (
     optimize_parameters,
     optimize_parameters_optuna,
@@ -37,17 +35,19 @@ from live_trading_engine import (
     stop_live_worker,
 )
 from okx_trading import OKXClient, OKXConfig
+from strategy_loader import compile_strategy_runtime_from_code
 
 
-# 物理解耦：回测项目固定为 backtest 模式
-MODE_LOCK = "backtest"
+MODE_LOCK = str(os.getenv("AUTOTRADE_MODE_LOCK", "")).strip().lower()
+if MODE_LOCK not in {"backtest", "live"}:
+    MODE_LOCK = ""
 
-st.set_page_config(page_title="Backtrader + Binance 交易系统", layout="wide")
+st.set_page_config(page_title="VectorBT + Binance 交易系统", layout="wide")
 if MODE_LOCK == "live":
     st.title("🟢 策略自动交易软件")
     st.caption("交易接口：OKX API（需配置 apis.toml）")
 else:
-    st.title("📈 Backtrader + Binance 回测软件")
+    st.title("📈 VectorBT + Binance 回测软件")
     st.caption("数据源：Binance Spot Kline API（公共接口）")
 
 APP_ROOT_DIR = Path(__file__).resolve().parent
@@ -82,7 +82,9 @@ PERSIST_STATE_KEYS = {
     "strategy_params_json",
     "initial_cash",
     "commission",
+    "position_sizing_mode",
     "position_percent",
+    "fixed_trade_amount",
     "leverage",
     "opt_method",
     "opt_objective",
@@ -110,9 +112,9 @@ PERSIST_STATE_KEYS = {
     "live_symbol_select",
     "live_symbol_custom",
     "live_interval",
-    "live_okx_inst_id",
     "live_okx_inst_type",
     "live_td_mode",
+    "live_leverage",
     "live_pos_side",
     "live_order_size",
     "live_poll_seconds",
@@ -136,12 +138,30 @@ COMMON_MARKET_SYMBOLS = [
     "LTCUSDT",
     "AVAXUSDT",
 ]
+OKX_SYMBOL_QUOTE_SUFFIXES = (
+    "USDT",
+    "USDC",
+    "BUSD",
+    "FDUSD",
+    "TUSD",
+    "DAI",
+    "BTC",
+    "ETH",
+    "USD",
+    "EUR",
+)
 
-NEW_STRATEGY_TEMPLATE = """import backtrader as bt
+NEW_STRATEGY_TEMPLATE = """from __future__ import annotations
+
+from typing import Any
+
+import numpy as np
+import pandas as pd
 
 STRATEGY_META = {
     "display_name": "我的策略",
     "strategy_class": "MyStrategy",
+    "signal_func": "generate_targets",
     "params": {
         "fast_period": {"type": "int", "default": 20, "min": 2, "max": 200, "step": 1},
         "slow_period": {"type": "int", "default": 60, "min": 5, "max": 500, "step": 1},
@@ -149,22 +169,39 @@ STRATEGY_META = {
 }
 
 
-class MyStrategy(bt.Strategy):
-    params = (
-        ("fast_period", 20),
-        ("slow_period", 60),
-    )
+def generate_targets(df: pd.DataFrame, params: dict[str, Any]) -> np.ndarray:
+    fast_period = int(params.get("fast_period", 20))
+    slow_period = int(params.get("slow_period", 60))
+    if fast_period < 2 or slow_period < 2 or fast_period >= slow_period:
+        raise ValueError("参数不合法")
 
-    def __init__(self):
-        fast_sma = bt.indicators.SimpleMovingAverage(self.data.close, period=self.params.fast_period)
-        slow_sma = bt.indicators.SimpleMovingAverage(self.data.close, period=self.params.slow_period)
-        self.crossover = bt.indicators.CrossOver(fast_sma, slow_sma)
+    close = pd.to_numeric(df["close"], errors="coerce").astype(float)
+    fast = close.rolling(window=fast_period, min_periods=fast_period).mean()
+    slow = close.rolling(window=slow_period, min_periods=slow_period).mean()
 
-    def next(self):
-        if not self.position and self.crossover > 0:
-            self.buy()
-        elif self.position and self.crossover < 0:
-            self.close()
+    n = len(df)
+    targets = np.full(n, np.nan, dtype=float)
+    pos = 0
+    for i in range(slow_period + 1, n):
+        fast_prev = float(fast.iloc[i - 1])
+        slow_prev = float(slow.iloc[i - 1])
+        if not np.isfinite(fast_prev) or not np.isfinite(slow_prev):
+            continue
+        if pos == 0 and fast_prev > slow_prev:
+            targets[i] = 1.0
+            pos = 1
+        elif pos == 1 and fast_prev < slow_prev:
+            targets[i] = 0.0
+            pos = 0
+    return targets
+
+
+class MyStrategy:
+    USE_GLOBAL_POSITION_PERCENT = True
+
+    @staticmethod
+    def generate_targets(df: pd.DataFrame, params: dict[str, Any]) -> np.ndarray:
+        return generate_targets(df, params)
 """
 
 DEFAULT_STRATEGY_FILES: dict[str, str] = {}
@@ -182,6 +219,46 @@ def _to_utc_start(d: date) -> datetime:
 
 def _to_utc_end(d: date) -> datetime:
     return datetime.combine(d + timedelta(days=1), time.min).replace(tzinfo=timezone.utc)
+
+
+def _infer_auto_warmup_bars(
+    strategy_params: dict[str, Any],
+    param_schema: dict[str, dict[str, Any]] | None = None,
+) -> int:
+    """
+    自动预热K线数量（无需前端设置）：
+    - 优先根据参数名里的周期类字段推断（period/window/lookback/length/span/cooldown）
+    - 兜底至少 32 根，最多 2000 根
+    """
+    schema = param_schema or {}
+    candidates: list[int] = []
+    hint_tokens = ("period", "window", "lookback", "length", "span", "cooldown")
+
+    for name, value in (strategy_params or {}).items():
+        key = str(name).lower()
+        if not any(token in key for token in hint_tokens):
+            continue
+        cfg = schema.get(name, {})
+        if str(cfg.get("type", "")).lower() not in {"int", "float"}:
+            continue
+        try:
+            v = float(value)
+        except Exception:  # noqa: BLE001
+            continue
+        if not math.isfinite(v) or v <= 0:
+            continue
+        candidates.append(int(math.ceil(v)))
+
+    base = max(candidates) if candidates else 30
+    warmup_bars = base + 2
+    return max(32, min(2000, int(warmup_bars)))
+
+
+def _calc_warmup_start_dt(start_dt: datetime, interval: str, warmup_bars: int) -> datetime:
+    interval_ms = INTERVAL_TO_MS.get(str(interval))
+    if interval_ms is None or warmup_bars <= 0:
+        return start_dt
+    return start_dt - timedelta(milliseconds=int(interval_ms) * int(warmup_bars))
 
 
 def _sanitize_name(name: str) -> str:
@@ -225,36 +302,8 @@ def _save_strategy_code(file_stem: str, code: str) -> Path:
 
 
 def _compile_strategy(code: str):
-    # 防止代码字符串开头含 BOM 导致 exec 报错: U+FEFF
-    code = code.lstrip("\ufeff")
-    namespace: dict[str, Any] = {"bt": bt}
-    exec(code, namespace, namespace)
-
-    strategy_classes = [
-        obj
-        for obj in namespace.values()
-        if inspect.isclass(obj) and issubclass(obj, bt.Strategy) and obj is not bt.Strategy
-    ]
-    if not strategy_classes:
-        raise ValueError("代码中未找到 bt.Strategy 子类")
-
-    meta = namespace.get("STRATEGY_META", {})
-    if not isinstance(meta, dict):
-        meta = {}
-
-    selected_cls = strategy_classes[0]
-    class_name = meta.get("strategy_class")
-    if isinstance(class_name, str) and class_name in namespace:
-        maybe_cls = namespace[class_name]
-        if inspect.isclass(maybe_cls) and issubclass(maybe_cls, bt.Strategy):
-            selected_cls = maybe_cls
-
-    display_name = str(meta.get("display_name", selected_cls.__name__))
-    params_schema = meta.get("params", {})
-    if not isinstance(params_schema, dict):
-        params_schema = {}
-
-    return selected_cls, display_name, params_schema
+    runtime = compile_strategy_runtime_from_code(code)
+    return runtime.strategy_obj, runtime.display_name, runtime.params_schema
 
 
 def _normalize_params_schema(raw_schema: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -319,6 +368,31 @@ def _normalize_market_symbol(value: Any) -> str:
     return text
 
 
+def _split_market_symbol_base_quote(value: Any) -> tuple[str, str] | None:
+    symbol = _normalize_market_symbol(value)
+    if not symbol:
+        return None
+    for quote in OKX_SYMBOL_QUOTE_SUFFIXES:
+        if symbol.endswith(quote) and len(symbol) > len(quote):
+            base = symbol[: -len(quote)]
+            if base:
+                return base, quote
+    return None
+
+
+def _build_okx_inst_id_from_symbol(value: Any, inst_type: Any) -> str | None:
+    parsed = _split_market_symbol_base_quote(value)
+    if parsed is None:
+        return None
+    base, quote = parsed
+    inst_type_text = str(inst_type or "").upper().strip()
+    if inst_type_text == "SPOT":
+        return f"{base}-{quote}"
+    if inst_type_text == "SWAP":
+        return f"{base}-{quote}-SWAP"
+    return None
+
+
 def _to_serializable(value: Any) -> Any:
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
@@ -354,6 +428,13 @@ def _normalize_persisted_choice(key: str, value: Any) -> Any:
         if text in {"live", "策略自动交易"} or "live" in low or "交易" in text:
             return "live"
         return "backtest"
+
+    if key == "position_sizing_mode":
+        if low in {"percent_equity", "percent", "pct"} or "百分比" in text:
+            return "percent_equity"
+        if low in {"fixed_amount", "fixed", "amount"} or "固定" in text:
+            return "fixed_amount"
+        return "percent_equity"
 
     if key == "opt_method":
         if "optuna" in low or "贝叶斯" in text:
@@ -392,7 +473,7 @@ def _normalize_persisted_choice(key: str, value: Any) -> Any:
 
 def _normalize_persisted_ui_state(raw: dict[str, Any]) -> dict[str, Any]:
     normalized: dict[str, Any] = {}
-    enum_keys = {"product_mode", "opt_method", "opt_grid_mode", "opt_objective", "opt_sampler"}
+    enum_keys = {"product_mode", "position_sizing_mode", "opt_method", "opt_grid_mode", "opt_objective", "opt_sampler"}
     # 避免历史 UI_STATE 中 strategy_code 过大/乱码影响启动，统一从策略文件加载
     ignored_keys = {"strategy_code"}
 
@@ -863,12 +944,14 @@ def _render_okx_trading_panel() -> None:
         st.session_state["live_symbol_custom"] = st.session_state["live_market_symbol"]
     if "live_interval" not in st.session_state:
         st.session_state["live_interval"] = "1m"
-    if "live_okx_inst_id" not in st.session_state:
-        st.session_state["live_okx_inst_id"] = "BTC-USDT-SWAP"
     if "live_okx_inst_type" not in st.session_state:
+        st.session_state["live_okx_inst_type"] = "SWAP"
+    if str(st.session_state.get("live_okx_inst_type", "SWAP")).upper().strip() not in {"SPOT", "SWAP"}:
         st.session_state["live_okx_inst_type"] = "SWAP"
     if "live_td_mode" not in st.session_state:
         st.session_state["live_td_mode"] = "cross"
+    if "live_leverage" not in st.session_state:
+        st.session_state["live_leverage"] = "5"
     if "live_pos_side" not in st.session_state:
         st.session_state["live_pos_side"] = "net"
     if "live_order_size" not in st.session_state:
@@ -928,17 +1011,39 @@ def _render_okx_trading_panel() -> None:
         st.selectbox("实时K线周期", ["1m", "5m", "15m", "1h", "4h", "1d"], key="live_interval")
         st.number_input("历史K线窗口", min_value=60, max_value=1000, step=10, key="live_lookback_bars")
     with live_col2:
-        st.text_input("实盘标的(instId)", key="live_okx_inst_id")
-        st.selectbox("实盘产品类型(instType)", ["SPOT", "MARGIN", "SWAP", "FUTURES", "OPTION"], key="live_okx_inst_type")
-        st.selectbox("实盘交易模式(tdMode)", ["cash", "cross", "isolated"], key="live_td_mode")
+        st.selectbox(
+            "实盘类型(instType)",
+            ["SPOT", "SWAP"],
+            key="live_okx_inst_type",
+            format_func=lambda x: "现货 (SPOT)" if x == "SPOT" else "合约 (SWAP)",
+        )
+        if str(st.session_state.get("live_okx_inst_type", "SWAP")).upper().strip() == "SPOT":
+            st.session_state["live_td_mode"] = "cash"
+            st.selectbox("实盘交易模式(tdMode)", ["cash"], key="live_td_mode")
+            st.caption("现货模式自动使用 cash，不执行做空。")
+        else:
+            if str(st.session_state.get("live_td_mode", "cross")).strip() not in {"cross", "isolated"}:
+                st.session_state["live_td_mode"] = "cross"
+            st.selectbox("实盘交易模式(tdMode)", ["cross", "isolated"], key="live_td_mode")
+            st.text_input("合约杠杆倍数(lever)", key="live_leverage", placeholder="例如 3 / 5 / 10")
     with live_col3:
         st.text_input("实盘下单数量(sz)", key="live_order_size")
-        st.selectbox("实盘持仓方向(posSide)", ["net", "long", "short", ""], key="live_pos_side", format_func=lambda x: "默认" if x == "" else x)
+        st.selectbox(
+            "实盘持仓方向(posSide)",
+            ["net", "long", "short", ""],
+            key="live_pos_side",
+            format_func=lambda x: "默认" if x == "" else x,
+            disabled=str(st.session_state.get("live_okx_inst_type", "SWAP")).upper().strip() == "SPOT",
+            help="现货模式下不使用该参数。",
+        )
         st.number_input("轮询秒数", min_value=2, max_value=3600, step=1, key="live_poll_seconds")
 
     st.checkbox("仅在新K线出现时执行", key="live_only_new_bar")
     st.checkbox("信号为FLAT时自动平仓", key="live_close_on_flat")
-    st.checkbox("允许做空信号执行", key="live_allow_short")
+    live_is_spot = str(st.session_state.get("live_okx_inst_type", "SWAP")).upper().strip() == "SPOT"
+    if live_is_spot:
+        st.session_state["live_allow_short"] = False
+    st.checkbox("允许做空信号执行", key="live_allow_short", disabled=live_is_spot, help="现货模式下自动禁用")
     st.checkbox("我确认启用策略自动交易", key="live_confirm_trade")
 
     once_btn, start_btn, stop_btn = st.columns(3)
@@ -947,23 +1052,49 @@ def _render_okx_trading_panel() -> None:
     stop_live = stop_btn.button("停止自动执行", use_container_width=True, key="live_stop")
 
     live_cfg = None
+    live_market_symbol = _normalize_market_symbol(st.session_state.get("live_market_symbol", "BTCUSDT")) or "BTCUSDT"
+    live_inst_type = str(st.session_state.get("live_okx_inst_type", "SWAP")).upper().strip()
+    derived_live_okx_inst_id = _build_okx_inst_id_from_symbol(live_market_symbol, live_inst_type)
+    live_leverage_text = str(st.session_state.get("live_leverage", "")).strip()
+    live_leverage_value: str | None = None
+    if live_inst_type == "SWAP":
+        if not live_leverage_text:
+            st.error("合约模式请填写杠杆倍数。")
+        else:
+            try:
+                leverage_float = float(live_leverage_text)
+            except Exception:  # noqa: BLE001
+                st.error("杠杆倍数格式错误，请输入数字。")
+            else:
+                if leverage_float <= 0:
+                    st.error("杠杆倍数必须大于 0。")
+                else:
+                    live_leverage_value = live_leverage_text
+    if derived_live_okx_inst_id:
+        st.caption(f"自动映射的 OKX 标的：`{derived_live_okx_inst_id}`")
+    else:
+        st.error("当前交易对无法自动映射为 OKX 标的，请检查交易对格式（例如 BTCUSDT）。")
+
     if live_strategy_cls is not None:
         live_cfg = LiveTradingConfig(
-            market_symbol=_normalize_market_symbol(st.session_state.get("live_market_symbol", "BTCUSDT")) or "BTCUSDT",
+            market_symbol=live_market_symbol,
             interval=str(st.session_state.get("live_interval", "1m")).strip(),
             lookback_bars=int(st.session_state.get("live_lookback_bars", 500)),
             poll_seconds=int(st.session_state.get("live_poll_seconds", 10)),
             only_new_bar=bool(st.session_state.get("live_only_new_bar", True)),
+            include_unclosed_last_bar=True,
             close_on_flat=bool(st.session_state.get("live_close_on_flat", True)),
-            allow_short=bool(st.session_state.get("live_allow_short", True)),
-            okx_inst_id=str(st.session_state.get("live_okx_inst_id", "")).strip(),
-            okx_inst_type=str(st.session_state.get("live_okx_inst_type", "SWAP")).strip(),
-            okx_td_mode=str(st.session_state.get("live_td_mode", "cross")).strip(),
-            okx_pos_side=(str(st.session_state.get("live_pos_side", "net")).strip() or "net"),
+            allow_short=(False if live_is_spot else bool(st.session_state.get("live_allow_short", True))),
+            okx_inst_id=derived_live_okx_inst_id or "",
+            okx_inst_type=live_inst_type,
+            okx_td_mode=("cash" if live_is_spot else str(st.session_state.get("live_td_mode", "cross")).strip()),
+            okx_pos_side=("" if live_is_spot else (str(st.session_state.get("live_pos_side", "net")).strip() or "net")),
+            okx_leverage=(None if live_is_spot else live_leverage_value),
             okx_ccy=(str(st.session_state.get("okx_ccy", "")).strip() or None),
             order_size=str(st.session_state.get("live_order_size", "0.01")).strip(),
             strategy_params=live_strategy_params,
             strategy_name=live_strategy_name,
+            position_percent=float(st.session_state.get("position_percent", 95.0)),
         )
 
     if run_once_live:
@@ -971,6 +1102,10 @@ def _render_okx_trading_panel() -> None:
             st.error("策略不可用，无法执行")
         elif not bool(st.session_state.get("live_confirm_trade", False)):
             st.error("请先勾选“我确认启用策略自动交易”")
+        elif not live_cfg.okx_inst_id:
+            st.error("交易对无法映射为 OKX 标的，请检查交易对格式（例如 BTCUSDT）。")
+        elif live_inst_type == "SWAP" and not live_cfg.okx_leverage:
+            st.error("合约模式下杠杆倍数无效，请检查输入。")
         else:
             live_result = execute_signal_once(
                 client=client,
@@ -982,6 +1117,7 @@ def _render_okx_trading_panel() -> None:
                 "instType": live_cfg.okx_inst_type,
                 "tdMode": live_cfg.okx_td_mode,
                 "posSide": live_cfg.okx_pos_side,
+                "lever": live_cfg.okx_leverage,
                 "sz": live_cfg.order_size,
                 "market_symbol": live_cfg.market_symbol,
                 "interval": live_cfg.interval,
@@ -1043,7 +1179,9 @@ def _render_okx_trading_panel() -> None:
         elif not bool(st.session_state.get("live_confirm_trade", False)):
             st.error("请先勾选“我确认启用策略自动交易”")
         elif not live_cfg.okx_inst_id:
-            st.error("请填写实盘标的(instId)")
+            st.error("交易对无法映射为 OKX 标的，请检查交易对格式（例如 BTCUSDT）。")
+        elif live_inst_type == "SWAP" and not live_cfg.okx_leverage:
+            st.error("合约模式下杠杆倍数无效，请检查输入。")
         else:
             start_live_worker(
                 key=LIVE_WORKER_KEY,
@@ -1090,7 +1228,9 @@ def _save_backtest_record(
     strategy_params: dict[str, Any],
     initial_cash: float,
     commission: float,
+    position_sizing_mode: str,
     position_percent: float,
+    fixed_trade_amount: float,
     leverage: float,
     selected_start_date: date,
     selected_end_date: date,
@@ -1126,7 +1266,9 @@ def _save_backtest_record(
         "strategy_params": strategy_params,
         "initial_cash": float(initial_cash),
         "commission": float(commission),
+        "position_sizing_mode": str(position_sizing_mode),
         "position_percent": float(position_percent),
+        "fixed_trade_amount": float(fixed_trade_amount),
         "leverage": float(leverage),
         "metrics": result_metrics,
     }
@@ -1150,7 +1292,9 @@ def _save_backtest_record(
         "strategy_params_json": json.dumps(detail_record["strategy_params"], ensure_ascii=False),
         "initial_cash": detail_record["initial_cash"],
         "commission": detail_record["commission"],
+        "position_sizing_mode": detail_record["position_sizing_mode"],
         "position_percent": detail_record["position_percent"],
+        "fixed_trade_amount": detail_record["fixed_trade_amount"],
         "leverage": detail_record["leverage"],
         "total_return_pct": detail_record["metrics"].get("总收益率(%)"),
         "annual_return_pct": detail_record["metrics"].get("年化收益率(%)"),
@@ -1586,8 +1730,12 @@ if "initial_cash" not in st.session_state:
     st.session_state["initial_cash"] = 10_000.0
 if "commission" not in st.session_state:
     st.session_state["commission"] = 0.001
+if "position_sizing_mode" not in st.session_state:
+    st.session_state["position_sizing_mode"] = "percent_equity"
 if "position_percent" not in st.session_state:
     st.session_state["position_percent"] = 95.0
+if "fixed_trade_amount" not in st.session_state:
+    st.session_state["fixed_trade_amount"] = 1_000.0
 if "leverage" not in st.session_state:
     st.session_state["leverage"] = 1.0
 if "opt_method" not in st.session_state:
@@ -1857,7 +2005,9 @@ with st.sidebar:
 
     initial_cash = float(st.session_state.get("initial_cash", 10_000.0))
     commission = float(st.session_state.get("commission", 0.001))
+    position_sizing_mode = str(st.session_state.get("position_sizing_mode", "percent_equity"))
     position_percent = float(st.session_state.get("position_percent", 95.0))
+    fixed_trade_amount = float(st.session_state.get("fixed_trade_amount", 1_000.0))
     leverage = float(st.session_state.get("leverage", 1.0))
     opt_method = str(st.session_state.get("opt_method", "Optuna(贝叶斯)"))
     opt_objective = str(st.session_state.get("opt_objective", "Sharpe"))
@@ -1878,7 +2028,26 @@ with st.sidebar:
         st.subheader("资金参数")
         initial_cash = st.number_input("初始资金(USDT)", min_value=100.0, step=100.0, key="initial_cash")
         commission = st.number_input("手续费率", min_value=0.0, max_value=0.01, step=0.0001, format="%.4f", key="commission")
-        position_percent = st.number_input("单次仓位(%)", min_value=1.0, max_value=100.0, step=1.0, key="position_percent")
+        sizing_mode_options = ["percent_equity", "fixed_amount"]
+        sizing_mode_label = {
+            "percent_equity": "每笔按账户百分比",
+            "fixed_amount": "每笔固定入场金额",
+        }
+        if st.session_state.get("position_sizing_mode") not in sizing_mode_options:
+            st.session_state["position_sizing_mode"] = "percent_equity"
+        position_sizing_mode = st.selectbox(
+            "仓位模式",
+            options=sizing_mode_options,
+            key="position_sizing_mode",
+            format_func=lambda x: sizing_mode_label.get(str(x), str(x)),
+        )
+        if position_sizing_mode == "percent_equity":
+            position_percent = st.number_input("单次仓位(%)", min_value=1.0, max_value=100.0, step=1.0, key="position_percent")
+            st.caption("每笔目标仓位 = 当前账户权益 × 单次仓位(%) × 杠杆倍数")
+        else:
+            fixed_trade_amount = float(initial_cash)
+            st.caption("固定金额模式下：每笔固定入场金额 = 初始资金（无需额外设置）")
+            st.caption("每笔目标名义仓位 = 初始资金 × 杠杆倍数")
         leverage = st.number_input("杠杆倍数", min_value=1.0, max_value=125.0, step=0.5, key="leverage")
 
         run_btn = st.button("开始回测", type="primary", use_container_width=True)
@@ -1951,7 +2120,14 @@ with st.sidebar:
             opt_points = st.slider("自动网格每参数点数", min_value=2, max_value=5, step=1, key="opt_points")
             if opt_grid_mode == "按step全展开":
                 st.caption("当前模式为按step全展开，“每参数点数”将被忽略。")
-            opt_max_combinations = st.number_input("最大回测组合数", min_value=10, max_value=1000, step=10, key="opt_max_combinations")
+            opt_max_combinations = st.number_input(
+                "最大回测组合数",
+                min_value=10,
+                max_value=200000,
+                step=100,
+                key="opt_max_combinations",
+                help="用于限制本次网格搜索实际执行的组合数量上限。",
+            )
             opt_trials = 0
             opt_sampler = "TPE"
             opt_seed = 42
@@ -2005,6 +2181,9 @@ if product_mode == "backtest" and (run_btn or optimize_btn):
     if not symbol:
         symbol = "BTCUSDT"
         st.warning("交易对为空，已自动使用默认值 BTCUSDT")
+    effective_fixed_trade_amount = (
+        float(initial_cash) if str(position_sizing_mode) == "fixed_amount" else 0.0
+    )
 
     if start_date >= end_date:
         st.error("开始日期必须早于结束日期")
@@ -2036,7 +2215,17 @@ if product_mode == "backtest" and (run_btn or optimize_btn):
         try:
             start_dt = _to_utc_start(start_date)
             end_dt = _to_utc_end(end_date)
-            df = load_binance_data(symbol, interval, start_dt, end_dt)
+            warmup_bars = _infer_auto_warmup_bars(strategy_params=strategy_params, param_schema=param_schema)
+            warmup_start_dt = _calc_warmup_start_dt(start_dt=start_dt, interval=interval, warmup_bars=warmup_bars)
+            df_full = load_binance_data(symbol, interval, warmup_start_dt, end_dt)
+            df = df_full
+            if isinstance(df_full.index, pd.DatetimeIndex):
+                start_ts = pd.Timestamp(start_dt)
+                df = df_full[df_full.index >= start_ts]
+            if df.empty:
+                st.warning("选定区间内没有可用数据，请调整时间范围")
+                st.stop()
+            st.caption(f"已自动使用历史预热数据：{warmup_bars} 根K线")
         except BinanceDataError as exc:
             st.error(f"数据获取失败：{exc}")
             st.stop()
@@ -2044,20 +2233,19 @@ if product_mode == "backtest" and (run_btn or optimize_btn):
             st.error(f"未知错误：{exc}")
             st.stop()
 
-    if df.empty:
-        st.warning("没有可用数据，请调整参数")
-        st.stop()
-
     if run_btn:
         with st.spinner("回测中，请稍候..."):
             result = run_backtest(
-                df=df,
+                df=df_full,
                 strategy_cls=strategy_cls,
                 strategy_params=strategy_params,
                 initial_cash=float(initial_cash),
                 commission=float(commission),
                 position_percent=float(position_percent),
                 leverage=float(leverage),
+                position_sizing_mode=str(position_sizing_mode),
+                fixed_trade_amount=float(effective_fixed_trade_amount),
+                evaluation_start=start_dt,
             )
 
         st.success("回测完成")
@@ -2070,7 +2258,9 @@ if product_mode == "backtest" and (run_btn or optimize_btn):
                 strategy_params=strategy_params,
                 initial_cash=float(initial_cash),
                 commission=float(commission),
+                position_sizing_mode=str(position_sizing_mode),
                 position_percent=float(position_percent),
+                fixed_trade_amount=float(effective_fixed_trade_amount),
                 leverage=float(leverage),
                 selected_start_date=start_date,
                 selected_end_date=end_date,
@@ -2250,6 +2440,8 @@ if product_mode == "backtest" and (run_btn or optimize_btn):
                         commission=float(commission),
                         position_percent=float(position_percent),
                         leverage=float(leverage),
+                        position_sizing_mode=str(position_sizing_mode),
+                        fixed_trade_amount=float(effective_fixed_trade_amount),
                         objective=opt_objective,
                         max_combinations=int(opt_max_combinations),
                         n_jobs=int(effective_workers),
@@ -2302,6 +2494,8 @@ if product_mode == "backtest" and (run_btn or optimize_btn):
                             commission=float(commission),
                             position_percent=float(position_percent),
                             leverage=float(leverage),
+                            position_sizing_mode=str(position_sizing_mode),
+                            fixed_trade_amount=float(effective_fixed_trade_amount),
                             objective=opt_objective,
                             folds=int(opt_folds),
                             max_combinations=int(opt_max_combinations),
@@ -2338,6 +2532,8 @@ if product_mode == "backtest" and (run_btn or optimize_btn):
                         commission=float(commission),
                         position_percent=float(position_percent),
                         leverage=float(leverage),
+                        position_sizing_mode=str(position_sizing_mode),
+                        fixed_trade_amount=float(effective_fixed_trade_amount),
                         objective=opt_objective,
                         n_trials=int(opt_trials),
                         sampler_name=str(opt_sampler),
@@ -2385,6 +2581,8 @@ if product_mode == "backtest" and (run_btn or optimize_btn):
                             commission=float(commission),
                             position_percent=float(position_percent),
                             leverage=float(leverage),
+                            position_sizing_mode=str(position_sizing_mode),
+                            fixed_trade_amount=float(effective_fixed_trade_amount),
                             objective=opt_objective,
                             folds=int(opt_folds),
                             n_trials=int(opt_trials),

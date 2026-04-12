@@ -1,121 +1,15 @@
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 from typing import Any, Callable
 
-import backtrader as bt
 import numpy as np
 import pandas as pd
 import vectorbt as vbt
 
 
-class LeverageCryptoCommissionInfo(bt.CommInfoBase):
-    """
-    Backtrader 兼容手续费模型（兜底路径）。
-    """
-
-    params = (
-        ("commission", 0.001),
-        ("commtype", bt.CommInfoBase.COMM_PERC),
-        ("percabs", True),
-        ("stocklike", True),
-        ("leverage", 1.0),
-    )
-
-    def getsize(self, price, cash):
-        if price <= 0:
-            return 0.0
-        cash = float(cash)
-        fee_factor = 1.0 + float(self.p.commission or 0.0)
-        if fee_factor <= 0:
-            fee_factor = 1.0
-        return float(self.p.leverage) * cash / (float(price) * fee_factor)
-
-
-class TargetPercentLeverageSizer(bt.Sizer):
-    """
-    Backtrader 兼容仓位Sizer（兜底路径）。
-    """
-
-    params = (
-        ("percents", 95.0),
-        ("leverage", 1.0),
-    )
-
-    def _getsizing(self, comminfo, cash, data, isbuy):  # noqa: ARG002
-        price = float(data.close[0] or 0.0)
-        if price <= 0:
-            return 0.0
-
-        perc = max(0.0, min(100.0, float(self.p.percents or 0.0)))
-        lev = max(1e-12, float(self.p.leverage or 1.0))
-        fee_factor = 1.0 + float(getattr(comminfo.p, "commission", 0.0) or 0.0)
-        if fee_factor <= 0:
-            fee_factor = 1.0
-
-        notional = float(cash) * (perc / 100.0) * lev
-        size = notional / (price * fee_factor)
-        return max(0.0, float(size))
-
-
-class EquityCurveAnalyzer(bt.Analyzer):
-    def start(self) -> None:
-        self.values = []
-
-    def next(self) -> None:
-        dt = self.strategy.datas[0].datetime.datetime(0)
-        value = self.strategy.broker.getvalue()
-        self.values.append((dt, value))
-
-    def get_analysis(self):
-        return self.values
-
-
-class TradeDetailAnalyzer(bt.Analyzer):
-    def start(self) -> None:
-        self.trades = []
-        self.local_trade_id = 0
-
-    def notify_trade(self, trade) -> None:
-        if not trade.isclosed:
-            return
-        self.local_trade_id += 1
-
-        history = list(getattr(trade, "history", []) or [])
-        entry = history[0] if history else None
-        exit_ = history[-1] if history else None
-
-        entry_status = entry.status if entry else None
-        exit_status = exit_.status if exit_ else None
-        entry_event = entry.event if entry else None
-        exit_event = exit_.event if exit_ else None
-
-        entry_dt = bt.num2date(entry_status.dt) if entry_status is not None else bt.num2date(trade.dtopen)
-        exit_dt = bt.num2date(exit_status.dt) if exit_status is not None else bt.num2date(trade.dtclose)
-
-        entry_price = float(entry_event.price) if entry_event is not None else float(getattr(trade, "price", 0.0))
-        exit_price = float(exit_event.price) if exit_event is not None else float(getattr(trade, "price", 0.0))
-
-        commission = float(getattr(trade, "pnl", 0.0) - getattr(trade, "pnlcomm", 0.0))
-
-        self.trades.append(
-            {
-                "交易ID": int(self.local_trade_id),
-                "方向": "LONG" if bool(getattr(trade, "long", True)) else "SHORT",
-                "开仓时间": entry_dt,
-                "平仓时间": exit_dt,
-                "开仓价格": round(entry_price, 8),
-                "平仓价格": round(exit_price, 8),
-                "毛收益": round(float(getattr(trade, "pnl", 0.0)), 8),
-                "净收益": round(float(getattr(trade, "pnlcomm", 0.0)), 8),
-                "手续费": round(commission, 8),
-                "交易后总资金": round(float(self.strategy.broker.getvalue()), 8),
-            }
-        )
-
-    def get_analysis(self):
-        return self.trades
+POSITION_SIZING_PERCENT_EQUITY = "percent_equity"
+POSITION_SIZING_FIXED_AMOUNT = "fixed_amount"
 
 
 @dataclass
@@ -123,18 +17,6 @@ class BacktestResult:
     metrics: dict[str, Any]
     equity_curve: pd.DataFrame
     trade_details: pd.DataFrame
-
-
-class BinancePandasData(bt.feeds.PandasData):
-    params = (
-        ("datetime", None),
-        ("open", "open"),
-        ("high", "high"),
-        ("low", "low"),
-        ("close", "close"),
-        ("volume", "volume"),
-        ("openinterest", -1),
-    )
 
 
 def _coerce_input_df(df: pd.DataFrame) -> pd.DataFrame:
@@ -145,9 +27,7 @@ def _coerce_input_df(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _infer_periods_per_year(index: pd.Index) -> float:
-    if len(index) < 3:
-        return 365.0
-    if not isinstance(index, pd.DatetimeIndex):
+    if len(index) < 3 or not isinstance(index, pd.DatetimeIndex):
         return 365.0
     sec = pd.Series(index).diff().dt.total_seconds().dropna()
     sec = sec[sec > 0]
@@ -193,307 +73,158 @@ def _sharpe_ratio(equity: pd.Series, periods_per_year: float) -> float | None:
     return (mean / std) * float(np.sqrt(max(periods_per_year, 1.0)))
 
 
-def _to_numeric_series(df: pd.DataFrame, col: str) -> pd.Series:
-    return pd.to_numeric(df[col], errors="coerce").astype(float)
+def _resolve_strategy_callable(strategy_cls) -> Callable[[pd.DataFrame, dict[str, Any]], np.ndarray | pd.Series]:
+    if strategy_cls is None:
+        raise ValueError("strategy_cls 不能为空")
+
+    maybe = getattr(strategy_cls, "generate_targets", None)
+    if callable(maybe):
+        return maybe
+
+    if callable(strategy_cls):
+        return strategy_cls
+
+    raise ValueError("策略对象必须可调用，或提供 generate_targets(df, params) 方法")
 
 
-def _sma(series: pd.Series, period: int) -> pd.Series:
-    return series.rolling(window=period, min_periods=period).mean()
+def _strategy_name(strategy_cls) -> str:
+    return str(getattr(strategy_cls, "__name__", strategy_cls.__class__.__name__))
 
 
-def _ema(series: pd.Series, period: int) -> pd.Series:
-    return series.ewm(span=period, adjust=False, min_periods=period).mean()
+def _normalize_position_sizing_mode(value: Any) -> str:
+    text = str(value or POSITION_SIZING_PERCENT_EQUITY).strip().lower()
+    if text in {
+        "percent",
+        "percent_equity",
+        "pct",
+        "equity_percent",
+        "account_percent",
+        "账户百分比",
+        "百分比",
+    }:
+        return POSITION_SIZING_PERCENT_EQUITY
+    if text in {
+        "fixed",
+        "fixed_amount",
+        "amount",
+        "固定金额",
+        "固定入场金额",
+    }:
+        return POSITION_SIZING_FIXED_AMOUNT
+    raise ValueError("position_sizing_mode 仅支持 'percent_equity' 或 'fixed_amount'")
 
 
-def _atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int) -> pd.Series:
-    prev_close = close.shift(1)
-    tr = pd.concat(
-        [
-            (high - low).abs(),
-            (high - prev_close).abs(),
-            (low - prev_close).abs(),
-        ],
-        axis=1,
-    ).max(axis=1)
-    return tr.ewm(alpha=1.0 / float(period), adjust=False, min_periods=period).mean()
+def _build_raw_target_series(df: pd.DataFrame, strategy_cls, strategy_params: dict[str, Any]) -> pd.Series:
+    fn = _resolve_strategy_callable(strategy_cls)
+    raw = fn(df, dict(strategy_params or {}))
+    target = pd.Series(raw, index=df.index, dtype=float)
+    if len(target) != len(df):
+        raise ValueError("策略返回的目标序列长度与输入K线长度不一致")
+    return target
 
 
-def _rsi_safe(close: pd.Series, period: int) -> pd.Series:
-    delta = close.diff()
-    gain = delta.clip(lower=0.0)
-    loss = (-delta).clip(lower=0.0)
-
-    avg_gain = gain.ewm(alpha=1.0 / float(period), adjust=False, min_periods=period).mean()
-    avg_loss = loss.ewm(alpha=1.0 / float(period), adjust=False, min_periods=period).mean()
-
-    rs = avg_gain / avg_loss.replace(0.0, np.nan)
-    rsi = 100.0 - (100.0 / (1.0 + rs))
-    rsi = rsi.where(avg_loss > 0.0, 100.0)
-    both_zero = (avg_gain <= 0.0) & (avg_loss <= 0.0)
-    rsi = rsi.where(~both_zero, 50.0)
-    return rsi
-
-
-def _targets_ma_faber(df: pd.DataFrame, params: dict[str, Any]) -> np.ndarray:
-    fast_period = int(params.get("fast_period", 11))
-    slow_period = int(params.get("slow_period", 220))
-    if fast_period < 2 or slow_period < 2:
-        raise ValueError("fast_period / slow_period 必须 >= 2")
-
-    close = _to_numeric_series(df, "close")
-    fast = _sma(close, fast_period)
-    slow = _sma(close, slow_period)
-
-    n = len(df)
-    targets = np.full(n, np.nan, dtype=float)
-    pos = 0
-    need_bars = slow_period + 1
-    for i in range(n):
-        if i < need_bars:
-            continue
-        fast_prev = float(fast.iloc[i - 1])
-        slow_prev = float(slow.iloc[i - 1])
-        if not np.isfinite(fast_prev) or not np.isfinite(slow_prev):
-            continue
-        if pos == 0 and fast_prev > slow_prev:
-            targets[i] = 1.0
-            pos = 1
-        elif pos == 1 and fast_prev < slow_prev:
-            targets[i] = 0.0
-            pos = 0
-    return targets
+def _apply_position_percent(
+    raw_target: pd.Series,
+    strategy_cls,
+    position_percent: float,
+    *,
+    leverage: float = 1.0,
+    apply_leverage_to_percent: bool = False,
+) -> pd.Series:
+    use_global = getattr(strategy_cls, "USE_GLOBAL_POSITION_PERCENT", True)
+    out = raw_target.astype(float).clip(lower=-1.0, upper=1.0)
+    if bool(use_global):
+        out = out * (float(position_percent) / 100.0)
+    if bool(apply_leverage_to_percent):
+        out = out * float(leverage)
+        return out
+    return out.clip(lower=-1.0, upper=1.0)
 
 
-def _targets_fast_rsi_flip(df: pd.DataFrame, params: dict[str, Any]) -> np.ndarray:
-    rsi_period = int(params.get("rsi_period", 12))
-    up = float(params.get("up", 53))
-    dn = float(params.get("dn", 36))
-    ema_period = int(params.get("ema_period", 66))
-    atr_period = int(params.get("atr_period", 26))
-    stop_atr = float(params.get("stop_atr", 0.5))
-    cooldown = int(params.get("cooldown", 12))
-    can_short = bool(int(params.get("can_short", 1)))
+def build_target_series(
+    df: pd.DataFrame,
+    strategy_cls,
+    strategy_params: dict[str, Any],
+    position_percent: float = 95,
+    position_sizing_mode: str = POSITION_SIZING_PERCENT_EQUITY,
+    fixed_trade_amount: float | None = None,
+    leverage: float = 1.0,
+    apply_leverage_to_percent: bool = False,
+) -> pd.Series:
+    """
+    生成传给 vectorbt 的 size 序列：
+    - percent_equity: size_type=targetpercent，对应值范围通常在 [-1, 1]
+    - fixed_amount:   size_type=targetvalue，对应值为目标名义金额（USDT）
+    """
+    data_df = _coerce_input_df(df)
+    raw_target = _build_raw_target_series(data_df, strategy_cls, strategy_params)
 
-    if rsi_period < 2 or ema_period < 2 or atr_period < 2:
-        raise ValueError("rsi_period / ema_period / atr_period 必须 >= 2")
-    if stop_atr <= 0:
-        raise ValueError("stop_atr 必须 > 0")
-    if cooldown < 0:
-        raise ValueError("cooldown 必须 >= 0")
-    if not (0 < dn < up < 100):
-        raise ValueError("参数约束必须满足：0 < dn < up < 100")
+    mode = _normalize_position_sizing_mode(position_sizing_mode)
+    if mode == POSITION_SIZING_PERCENT_EQUITY:
+        position_percent = float(position_percent)
+        if position_percent <= 0:
+            raise ValueError("position_percent 必须大于 0")
+        return _apply_position_percent(
+            raw_target,
+            strategy_cls,
+            position_percent,
+            leverage=leverage,
+            apply_leverage_to_percent=apply_leverage_to_percent,
+        )
 
-    close = _to_numeric_series(df, "close")
-    ema = _ema(close, ema_period)
-    rsi = _rsi_safe(close, rsi_period)
-    atr = _atr(_to_numeric_series(df, "high"), _to_numeric_series(df, "low"), close, atr_period)
+    amount = float(fixed_trade_amount if fixed_trade_amount is not None else 0.0)
+    if amount <= 0:
+        raise ValueError("fixed_trade_amount 必须大于 0")
 
-    n = len(df)
-    targets = np.full(n, np.nan, dtype=float)
-    pos = 0
-    entry_price: float | None = None
-    entry_atr: float | None = None
-    last_flat_bar = -10**9
-    need_bars = max(rsi_period, ema_period, atr_period) + 1
+    lev = float(leverage)
+    if lev <= 0:
+        raise ValueError("leverage 必须大于 0")
 
-    for i in range(n):
-        if i < need_bars:
-            continue
-        close_now = float(close.iloc[i])
-        ema_prev = float(ema.iloc[i - 1])
-        rsi_prev = float(rsi.iloc[i - 1])
-        atr_prev = float(atr.iloc[i - 1])
-        if not np.isfinite(close_now) or not np.isfinite(ema_prev) or not np.isfinite(rsi_prev) or not np.isfinite(atr_prev):
-            continue
-
-        if pos > 0:
-            atr_used = float(entry_atr) if entry_atr is not None else atr_prev
-            stop_price = float(entry_price) - atr_used * stop_atr
-            if close_now < stop_price or rsi_prev < dn:
-                targets[i] = 0.0
-                pos = 0
-                entry_price = None
-                entry_atr = None
-                last_flat_bar = i
-            continue
-
-        if pos < 0:
-            atr_used = float(entry_atr) if entry_atr is not None else atr_prev
-            stop_price = float(entry_price) + atr_used * stop_atr
-            if close_now > stop_price or rsi_prev > up:
-                targets[i] = 0.0
-                pos = 0
-                entry_price = None
-                entry_atr = None
-                last_flat_bar = i
-            continue
-
-        if i - last_flat_bar <= cooldown:
-            continue
-
-        if close_now > ema_prev and rsi_prev > up:
-            targets[i] = 1.0
-            pos = 1
-            entry_price = close_now
-            entry_atr = atr_prev
-            continue
-
-        if can_short and close_now < ema_prev and rsi_prev < dn:
-            targets[i] = -1.0
-            pos = -1
-            entry_price = close_now
-            entry_atr = atr_prev
-            continue
-
-    return targets
+    # fixed_amount 视为“保证金金额”，实际目标名义金额 = fixed_trade_amount * leverage
+    target_value = raw_target.astype(float) * amount * lev
+    return target_value
 
 
-def _targets_donchian_breakout(df: pd.DataFrame, params: dict[str, Any]) -> np.ndarray:
-    entry_period = int(params.get("entry_period", 55))
-    exit_period = int(params.get("exit_period", 20))
-    atr_period = int(params.get("atr_period", 14))
-    atr_filter_enabled = bool(int(params.get("atr_filter_enabled", 1)))
-    atr_ratio_min = float(params.get("atr_ratio_min", 0.003))
-    atr_ratio_max = float(params.get("atr_ratio_max", 0.05))
-    stop_atr_mult = float(params.get("stop_atr_mult", 2.0))
-    trail_atr_mult = float(params.get("trail_atr_mult", 2.0))
-    can_short = bool(int(params.get("can_short", 1)))
-    target_percent = float(params.get("target_percent", 0.95))
+def infer_latest_signal(
+    df: pd.DataFrame,
+    strategy_cls,
+    strategy_params: dict[str, Any],
+    position_percent: float = 95,
+    position_sizing_mode: str = POSITION_SIZING_PERCENT_EQUITY,
+    fixed_trade_amount: float | None = None,
+    leverage: float = 1.0,
+) -> dict[str, Any]:
+    data_df = _coerce_input_df(df)
+    if data_df.empty:
+        raise ValueError("输入K线为空")
 
-    if entry_period < 2 or exit_period < 2 or atr_period < 2:
-        raise ValueError("entry_period / exit_period / atr_period 必须 >= 2")
-    if not (0 < target_percent <= 1):
-        raise ValueError("target_percent 必须在 (0, 1] 区间")
-    if atr_ratio_min <= 0 or atr_ratio_max <= 0:
-        raise ValueError("atr_ratio_min / atr_ratio_max 必须 > 0")
-    if atr_ratio_min >= atr_ratio_max:
-        raise ValueError("atr_ratio_min 必须小于 atr_ratio_max")
-    if stop_atr_mult <= 0:
-        raise ValueError("stop_atr_mult 必须 > 0")
-    if trail_atr_mult <= 0:
-        raise ValueError("trail_atr_mult 必须 > 0")
+    target = build_target_series(
+        data_df,
+        strategy_cls,
+        strategy_params,
+        position_percent=position_percent,
+        position_sizing_mode=position_sizing_mode,
+        fixed_trade_amount=fixed_trade_amount,
+        leverage=leverage,
+        apply_leverage_to_percent=False,
+    )
+    held = target.ffill().fillna(0.0)
+    latest_pos = float(held.iloc[-1])
+    signal = "FLAT"
+    if latest_pos > 0:
+        signal = "LONG"
+    elif latest_pos < 0:
+        signal = "SHORT"
 
-    close = _to_numeric_series(df, "close")
-    high = _to_numeric_series(df, "high")
-    low = _to_numeric_series(df, "low")
-
-    entry_upper_prev = high.rolling(window=entry_period, min_periods=entry_period).max().shift(1)
-    entry_lower_prev = low.rolling(window=entry_period, min_periods=entry_period).min().shift(1)
-    exit_upper_prev = high.rolling(window=exit_period, min_periods=exit_period).max().shift(1)
-    exit_lower_prev = low.rolling(window=exit_period, min_periods=exit_period).min().shift(1)
-    atr_prev_ser = _atr(high, low, close, atr_period).shift(1)
-
-    n = len(df)
-    targets = np.full(n, np.nan, dtype=float)
-
-    pos = 0
-    entry_price: float | None = None
-    entry_atr: float | None = None
-    highest_since_entry: float | None = None
-    lowest_since_entry: float | None = None
-    need_bars = max(entry_period, exit_period, atr_period) + 1
-
-    for i in range(n):
-        if i < need_bars:
-            continue
-
-        close_now = float(close.iloc[i])
-        high_now = float(high.iloc[i])
-        low_now = float(low.iloc[i])
-        atr_prev = float(atr_prev_ser.iloc[i])
-        eu_prev = float(entry_upper_prev.iloc[i])
-        el_prev = float(entry_lower_prev.iloc[i])
-        xu_prev = float(exit_upper_prev.iloc[i])
-        xl_prev = float(exit_lower_prev.iloc[i])
-
-        values = (close_now, high_now, low_now, atr_prev, eu_prev, el_prev, xu_prev, xl_prev)
-        if any(not np.isfinite(v) for v in values):
-            continue
-
-        volatility_ok = True
-        if atr_filter_enabled:
-            atr_ratio = atr_prev / max(abs(close_now), 1e-12)
-            volatility_ok = atr_ratio_min <= atr_ratio <= atr_ratio_max
-
-        if pos > 0:
-            highest_since_entry = high_now if highest_since_entry is None else max(float(highest_since_entry), high_now)
-            if entry_price is not None and entry_atr is not None:
-                long_stop = float(entry_price) - float(entry_atr) * stop_atr_mult
-                if close_now < long_stop:
-                    targets[i] = 0.0
-                    pos = 0
-                    entry_price = None
-                    entry_atr = None
-                    highest_since_entry = None
-                    lowest_since_entry = None
-                    continue
-
-            trail_atr = float(entry_atr) if entry_atr is not None else atr_prev
-            trailing_stop_long = float(highest_since_entry) - trail_atr_mult * trail_atr
-            long_exit_line = max(xl_prev, trailing_stop_long)
-            if close_now < long_exit_line:
-                targets[i] = 0.0
-                pos = 0
-                entry_price = None
-                entry_atr = None
-                highest_since_entry = None
-                lowest_since_entry = None
-            continue
-
-        if pos < 0:
-            lowest_since_entry = low_now if lowest_since_entry is None else min(float(lowest_since_entry), low_now)
-            if entry_price is not None and entry_atr is not None:
-                short_stop = float(entry_price) + float(entry_atr) * stop_atr_mult
-                if close_now > short_stop:
-                    targets[i] = 0.0
-                    pos = 0
-                    entry_price = None
-                    entry_atr = None
-                    highest_since_entry = None
-                    lowest_since_entry = None
-                    continue
-
-            trail_atr = float(entry_atr) if entry_atr is not None else atr_prev
-            trailing_stop_short = float(lowest_since_entry) + trail_atr_mult * trail_atr
-            short_exit_line = min(xu_prev, trailing_stop_short)
-            if close_now > short_exit_line:
-                targets[i] = 0.0
-                pos = 0
-                entry_price = None
-                entry_atr = None
-                highest_since_entry = None
-                lowest_since_entry = None
-            continue
-
-        if not volatility_ok:
-            continue
-
-        if close_now > eu_prev:
-            targets[i] = float(target_percent)
-            pos = 1
-            entry_price = close_now
-            entry_atr = atr_prev
-            highest_since_entry = close_now
-            lowest_since_entry = close_now
-            continue
-
-        if can_short and close_now < el_prev:
-            targets[i] = -float(target_percent)
-            pos = -1
-            entry_price = close_now
-            entry_atr = atr_prev
-            highest_since_entry = close_now
-            lowest_since_entry = close_now
-            continue
-
-    return targets
-
-
-_VECTORBT_STRATEGY_RUNNERS: dict[str, Callable[[pd.DataFrame, dict[str, Any]], np.ndarray]] = {
-    "FaberMaTrendStrategy": _targets_ma_faber,
-    "FastRsiFlipStrategy": _targets_fast_rsi_flip,
-    "DonchianChannelBreakoutStrategy": _targets_donchian_breakout,
-}
+    close = pd.to_numeric(data_df["close"], errors="coerce").astype(float)
+    return {
+        "signal": signal,
+        "strategy_position": latest_pos,
+        "latest_bar_time": data_df.index[-1].to_pydatetime() if isinstance(data_df.index, pd.DatetimeIndex) else data_df.index[-1],
+        "latest_close": float(close.iloc[-1]),
+        "bars": int(len(data_df)),
+        "position_sizing_mode": _normalize_position_sizing_mode(position_sizing_mode),
+    }
 
 
 def _lookup_equity_at(equity: pd.Series, ts: Any) -> float:
@@ -501,12 +232,6 @@ def _lookup_equity_at(equity: pd.Series, ts: Any) -> float:
         return 0.0
     if ts in equity.index:
         return float(equity.loc[ts])
-
-    if isinstance(ts, (int, np.integer)):
-        idx = int(ts)
-        if 0 <= idx < len(equity):
-            return float(equity.iloc[idx])
-
     try:
         ts_dt = pd.to_datetime(ts)
         if ts_dt in equity.index:
@@ -554,59 +279,297 @@ def _vectorbt_trade_details(closed: pd.DataFrame, equity: pd.Series) -> pd.DataF
     return out
 
 
-def _run_backtest_vectorbt(
-    df: pd.DataFrame,
-    strategy_cls,
-    strategy_params: dict[str, Any],
-    initial_cash: float,
+def _build_portfolio(
+    *,
+    close: pd.Series,
+    size: pd.Series,
+    size_type: str,
+    open_: pd.Series,
     commission: float,
-    position_percent: float,
-    leverage: float,
-    include_details: bool,
-) -> BacktestResult:
-    data_df = _coerce_input_df(df)
-    strategy_name = str(getattr(strategy_cls, "__name__", "") or "")
-    runner = _VECTORBT_STRATEGY_RUNNERS.get(strategy_name)
-    if runner is None:
-        raise ValueError(f"策略 {strategy_name} 暂未接入 vectorbt 引擎")
-
-    close = _to_numeric_series(data_df, "close")
-    if close.empty:
-        raise ValueError("输入K线为空")
-
-    target = pd.Series(runner(data_df, strategy_params), index=data_df.index, dtype=float)
-    if strategy_name != "DonchianChannelBreakoutStrategy":
-        target = target * (float(position_percent) / 100.0)
-
-    target = target.clip(lower=-1.0, upper=1.0)
-    sim_init_cash = float(initial_cash) * float(leverage)
-    if sim_init_cash <= 0:
-        raise ValueError("initial_cash * leverage 必须大于 0")
-
-    pf = vbt.Portfolio.from_orders(
+    sim_init_cash: float,
+):
+    return vbt.Portfolio.from_orders(
         close=close,
-        size=target,
-        size_type="targetpercent",
+        size=size,
+        size_type=size_type,
+        price=open_,
         fees=float(commission),
         init_cash=sim_init_cash,
         freq=None,
     )
 
-    equity_sim = pf.value()
-    equity = float(initial_cash) + (equity_sim - sim_init_cash)
-    equity = equity.astype(float)
 
-    final_value = float(equity.iloc[-1]) if not equity.empty else float(initial_cash)
-    total_return = (final_value / float(initial_cash) - 1.0) * 100.0
-    periods_per_year = _infer_periods_per_year(data_df.index)
-    sharpe = _sharpe_ratio(equity, periods_per_year)
-    annual_ret = _annual_return_pct(float(initial_cash), final_value, data_df.index, periods_per_year)
-    max_dd = _max_drawdown_pct(equity)
+def _estimate_virtual_init_cash_for_fixed_mode(size: pd.Series, initial_cash: float) -> float:
+    """
+    fixed_amount 回测需要保持“每笔固定名义金额”稳定，不受账户权益下滑影响。
+    因此给 vectorbt 一个更大的“虚拟资金池”，避免因现金不足出现缩单/拒单。
+    """
+    s = pd.to_numeric(size, errors="coerce").astype(float)
+    finite = s.replace([np.inf, -np.inf], np.nan).dropna()
+    if finite.empty:
+        return max(float(initial_cash), 1.0)
+
+    max_notional = float(np.abs(finite).max())
+    if not np.isfinite(max_notional) or max_notional <= 0.0:
+        return max(float(initial_cash), 1.0)
+
+    non_zero_cmd = finite[np.abs(finite) > 1e-12]
+    cmd_count = int(len(non_zero_cmd))
+    reserve_units = int(max(10, min(200_000, cmd_count + 5)))
+    virtual_cash = max(float(initial_cash), max_notional * float(reserve_units))
+    return float(virtual_cash)
+
+
+def _run_with_liquidation_guard(
+    *,
+    close: pd.Series,
+    open_: pd.Series,
+    size: pd.Series,
+    size_type: str,
+    position_sizing_mode: str,
+    leverage: float,
+    commission: float,
+    initial_cash: float,
+    sim_init_cash: float,
+) -> tuple[Any, pd.Series, pd.Series, int | None]:
+    """
+    防止“权益<=0 后仍继续交易”：
+    - 若检测到权益<=0，则从该 bar 起强制目标仓位为 0
+    - 若仍<=0，则从爆仓 bar 起将权益固定为 0
+    """
+    mode = _normalize_position_sizing_mode(position_sizing_mode)
+    lev = float(leverage)
+    if lev <= 0:
+        raise ValueError("leverage 必须大于 0")
+
+    size_used = size.copy()
+    liquidation_idx: int | None = None
+
+    def _equity_from_pf_value_cross(value: pd.Series) -> pd.Series:
+        value = value.astype(float)
+        return (float(initial_cash) + (value - sim_init_cash)).astype(float)
+
+    def _equity_from_pf_value_isolated_percent(value: pd.Series, asset_value: pd.Series) -> tuple[pd.Series, int | None]:
+        value = value.astype(float)
+        asset_value = asset_value.astype(float)
+        prev = value.shift(1)
+        if len(prev) > 0:
+            prev.iloc[0] = float(initial_cash)
+        prev = prev.replace(0.0, np.nan)
+        base_ret = (value / prev - 1.0).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+        cmd = size_used.astype(float)
+        pos = cmd.ffill().fillna(0.0)
+        lev_ret = pd.Series(0.0, index=value.index, dtype=float)
+        liq_idx_local: int | None = None
+        liquidated_active = False
+
+        for i in range(len(value)):
+            if i == 0:
+                continue
+            cmd_i = cmd.iloc[i]
+            if np.isfinite(cmd_i):
+                liquidated_active = False
+
+            p_alloc = abs(float(pos.iloc[i]))
+            if p_alloc <= 1e-12:
+                lev_ret.iloc[i] = 0.0
+                liquidated_active = False
+                continue
+
+            raw = float(base_ret.iloc[i]) * lev
+            floor = -p_alloc
+            if liquidated_active:
+                lev_ret.iloc[i] = 0.0
+                continue
+
+            if raw < floor:
+                lev_ret.iloc[i] = floor
+                liquidated_active = True
+                if liq_idx_local is None:
+                    liq_idx_local = int(i)
+            else:
+                lev_ret.iloc[i] = raw
+
+        equity = float(initial_cash) * (1.0 + lev_ret).cumprod()
+        return equity.astype(float), liq_idx_local
+
+    if mode == POSITION_SIZING_PERCENT_EQUITY:
+        pf = _build_portfolio(
+            close=close,
+            size=size_used,
+            size_type=size_type,
+            open_=open_,
+            commission=commission,
+            sim_init_cash=sim_init_cash,
+        )
+        equity, liquidation_idx = _equity_from_pf_value_isolated_percent(pf.value(), pf.asset_value())
+        # isolated 模式下仅允许单笔爆仓，不应导致后续全局停摆；仅当总权益<=0时归零并停止
+        bad_idx = np.where(np.asarray(equity.values, dtype=float) <= 0.0)[0]
+        if bad_idx.size > 0:
+            idx = int(bad_idx[0])
+            liquidation_idx = idx if liquidation_idx is None else min(liquidation_idx, idx)
+            equity.iloc[idx:] = 0.0
+        return pf, equity, size_used, liquidation_idx
+
+    if mode == POSITION_SIZING_FIXED_AMOUNT:
+        # 固定金额模式用于评估“固定下注规模”的长期能力：
+        # 不因账户权益下降而停止后续交易，因此不启用全局清算停摆逻辑。
+        pf = _build_portfolio(
+            close=close,
+            size=size_used,
+            size_type=size_type,
+            open_=open_,
+            commission=commission,
+            sim_init_cash=sim_init_cash,
+        )
+        equity = _equity_from_pf_value_cross(pf.value())
+        return pf, equity, size_used, None
+
+    for _ in range(3):
+        pf = _build_portfolio(
+            close=close,
+            size=size_used,
+            size_type=size_type,
+            open_=open_,
+            commission=commission,
+            sim_init_cash=sim_init_cash,
+        )
+        equity = _equity_from_pf_value_cross(pf.value())
+
+        bad_idx = np.where(np.asarray(equity.values, dtype=float) <= 0.0)[0]
+        if bad_idx.size == 0:
+            return pf, equity, size_used, liquidation_idx
+
+        idx = int(bad_idx[0])
+        liquidation_idx = idx if liquidation_idx is None else min(liquidation_idx, idx)
+        size_used.iloc[idx:] = 0.0
+
+    # 多轮后仍<=0，按爆仓处理
+    pf = _build_portfolio(
+        close=close,
+        size=size_used,
+        size_type=size_type,
+        open_=open_,
+        commission=commission,
+        sim_init_cash=sim_init_cash,
+    )
+    equity = _equity_from_pf_value_cross(pf.value())
+    bad_idx = np.where(np.asarray(equity.values, dtype=float) <= 0.0)[0]
+    if bad_idx.size > 0:
+        idx = int(bad_idx[0])
+        liquidation_idx = idx if liquidation_idx is None else min(liquidation_idx, idx)
+        equity.iloc[liquidation_idx:] = 0.0
+
+    return pf, equity, size_used, liquidation_idx
+
+
+def run_backtest(
+    df: pd.DataFrame,
+    strategy_cls,
+    strategy_params: dict[str, Any],
+    initial_cash: float = 10_000,
+    commission: float = 0.001,
+    position_percent: float = 95,
+    leverage: float = 1.0,
+    include_details: bool = True,
+    position_sizing_mode: str = POSITION_SIZING_PERCENT_EQUITY,
+    fixed_trade_amount: float | None = None,
+    evaluation_start: Any | None = None,
+) -> BacktestResult:
+    leverage = float(leverage)
+    if leverage <= 0:
+        raise ValueError("leverage 必须大于 0")
+
+    mode = _normalize_position_sizing_mode(position_sizing_mode)
+    effective_fixed_trade_amount: float | None = None
+    if mode == POSITION_SIZING_PERCENT_EQUITY:
+        position_percent = float(position_percent)
+        if position_percent <= 0:
+            raise ValueError("position_percent 必须大于 0")
+    else:
+        if fixed_trade_amount is None:
+            effective_fixed_trade_amount = float(initial_cash)
+        else:
+            effective_fixed_trade_amount = float(fixed_trade_amount)
+        if effective_fixed_trade_amount <= 0:
+            raise ValueError("fixed_trade_amount（固定模式下默认等于初始资金）必须大于 0")
+
+    data_df = _coerce_input_df(df)
+    close = pd.to_numeric(data_df["close"], errors="coerce").astype(float)
+    open_ = pd.to_numeric(data_df["open"], errors="coerce").astype(float)
+    if close.empty:
+        raise ValueError("输入K线为空")
+
+    eval_start_ts: pd.Timestamp | None = None
+    if evaluation_start is not None and isinstance(data_df.index, pd.DatetimeIndex):
+        eval_start_ts_raw = pd.to_datetime(evaluation_start, errors="coerce", utc=True)
+        if pd.isna(eval_start_ts_raw):
+            raise ValueError(f"evaluation_start 无法解析: {evaluation_start}")
+        eval_start_ts = pd.Timestamp(eval_start_ts_raw).tz_convert("UTC").tz_localize(None)
+
+    size = build_target_series(
+        data_df,
+        strategy_cls,
+        strategy_params,
+        position_percent=position_percent,
+        position_sizing_mode=mode,
+        fixed_trade_amount=effective_fixed_trade_amount,
+        leverage=leverage,
+        apply_leverage_to_percent=False,
+    )
+    if eval_start_ts is not None:
+        size = size.copy()
+        size.loc[size.index < eval_start_ts] = 0.0
+
+    size_type = "targetpercent" if mode == POSITION_SIZING_PERCENT_EQUITY else "targetvalue"
+
+    if mode == POSITION_SIZING_PERCENT_EQUITY:
+        sim_init_cash = float(initial_cash)
+    else:
+        # fixed_amount 模式：使用“虚拟资金池”保证每笔固定金额不会因权益回撤被缩单
+        sim_init_cash = _estimate_virtual_init_cash_for_fixed_mode(size=size, initial_cash=float(initial_cash))
+    if sim_init_cash <= 0:
+        raise ValueError("sim_init_cash 必须大于 0")
+
+    pf, equity, size_used, liquidation_idx = _run_with_liquidation_guard(
+        close=close,
+        open_=open_,
+        size=size,
+        size_type=size_type,
+        position_sizing_mode=mode,
+        leverage=leverage,
+        commission=float(commission),
+        initial_cash=float(initial_cash),
+        sim_init_cash=sim_init_cash,
+    )
+    if eval_start_ts is not None:
+        eval_mask = data_df.index >= eval_start_ts
+        if not bool(np.asarray(eval_mask).any()):
+            raise ValueError("evaluation_start 晚于数据末尾，无法评估")
+        equity_eval = equity.loc[eval_mask]
+        data_df_eval = data_df.loc[eval_mask]
+    else:
+        equity_eval = equity
+        data_df_eval = data_df
+
+    initial_cash_eval = float(equity_eval.iloc[0]) if not equity_eval.empty else float(initial_cash)
+    if initial_cash_eval <= 0:
+        initial_cash_eval = float(initial_cash)
+    final_value = max(0.0, float(equity_eval.iloc[-1])) if not equity_eval.empty else float(initial_cash_eval)
+    total_return = (final_value / float(initial_cash_eval) - 1.0) * 100.0
+    periods_per_year = _infer_periods_per_year(data_df_eval.index)
+    sharpe = _sharpe_ratio(equity_eval, periods_per_year)
+    annual_ret = _annual_return_pct(float(initial_cash_eval), final_value, data_df_eval.index, periods_per_year)
+    max_dd = _max_drawdown_pct(equity_eval)
 
     trades = pf.trades.records_readable
     closed = trades.copy()
     if "Status" in closed.columns:
         closed = closed[closed["Status"].astype(str).str.lower() == "closed"]
+    if eval_start_ts is not None and not closed.empty and "Entry Timestamp" in closed.columns:
+        entry_ts = pd.to_datetime(closed["Entry Timestamp"], errors="coerce", utc=True).dt.tz_localize(None)
+        closed = closed[entry_ts >= eval_start_ts]
 
     total_trades = int(len(closed))
     wins = int((pd.to_numeric(closed.get("PnL"), errors="coerce").fillna(0.0) > 0.0).sum()) if total_trades > 0 else 0
@@ -614,7 +577,7 @@ def _run_backtest_vectorbt(
     win_rate = (wins / total_trades * 100.0) if total_trades > 0 else 0.0
 
     if include_details:
-        equity_curve = pd.DataFrame({"datetime": data_df.index, "equity": equity.values})
+        equity_curve = pd.DataFrame({"datetime": data_df_eval.index, "equity": equity_eval.values})
         trade_details = _vectorbt_trade_details(closed=closed, equity=equity)
     else:
         equity_curve = pd.DataFrame(columns=["datetime", "equity"])
@@ -631,164 +594,12 @@ def _run_backtest_vectorbt(
         "盈利次数": wins,
         "亏损次数": losses,
         "胜率(%)": round(win_rate, 2),
+        "仓位模式": "每笔账户百分比" if mode == POSITION_SIZING_PERCENT_EQUITY else "每笔固定金额",
+        "单次仓位(%)": round(float(position_percent), 4) if mode == POSITION_SIZING_PERCENT_EQUITY else None,
+        "固定入场金额(USDT)": (
+            round(float(effective_fixed_trade_amount), 4) if mode == POSITION_SIZING_FIXED_AMOUNT else None
+        ),
+        "触发清算保护": bool(liquidation_idx is not None),
+        "清算保护时间": None if liquidation_idx is None else str(data_df.index[int(liquidation_idx)]),
     }
     return BacktestResult(metrics=metrics, equity_curve=equity_curve, trade_details=trade_details)
-
-
-def _run_backtest_backtrader(
-    df: pd.DataFrame,
-    strategy_cls,
-    strategy_params: dict[str, Any],
-    initial_cash: float = 10_000,
-    commission: float = 0.001,
-    position_percent: float = 95,
-    leverage: float = 1.0,
-    include_details: bool = True,
-) -> BacktestResult:
-    data_df = _coerce_input_df(df)
-    include_details = bool(include_details)
-    cerebro = bt.Cerebro(stdstats=False, tradehistory=include_details)
-    data = BinancePandasData(dataname=data_df)
-
-    cerebro.adddata(data)
-    cerebro.addstrategy(strategy_cls, **strategy_params)
-
-    cerebro.broker.setcash(initial_cash)
-    comminfo = LeverageCryptoCommissionInfo(commission=commission, leverage=leverage)
-    cerebro.broker.addcommissioninfo(comminfo)
-    cerebro.addsizer(TargetPercentLeverageSizer, percents=position_percent, leverage=leverage)
-
-    cerebro.addanalyzer(
-        bt.analyzers.SharpeRatio_A,
-        _name="sharpe",
-        timeframe=bt.TimeFrame.Days,
-        compression=1,
-        factor=365,
-        riskfreerate=0.0,
-        convertrate=True,
-        annualize=True,
-    )
-    cerebro.addanalyzer(bt.analyzers.DrawDown, _name="drawdown")
-    cerebro.addanalyzer(bt.analyzers.TradeAnalyzer, _name="trades")
-    cerebro.addanalyzer(
-        bt.analyzers.Returns,
-        _name="returns",
-        timeframe=bt.TimeFrame.Days,
-        compression=1,
-        tann=365,
-    )
-    if include_details:
-        cerebro.addanalyzer(EquityCurveAnalyzer, _name="equity")
-        cerebro.addanalyzer(TradeDetailAnalyzer, _name="trade_details")
-
-    result = cerebro.run()[0]
-
-    final_value = cerebro.broker.getvalue()
-    total_return = (final_value / initial_cash - 1) * 100
-
-    sharpe_data = result.analyzers.sharpe.get_analysis()
-    drawdown_data = result.analyzers.drawdown.get_analysis()
-    trade_data = result.analyzers.trades.get_analysis()
-    returns_data = result.analyzers.returns.get_analysis()
-
-    total_trades = int(trade_data.get("total", {}).get("closed", 0) or 0)
-    won_trades = int(trade_data.get("won", {}).get("total", 0) or 0)
-    lost_trades = int(trade_data.get("lost", {}).get("total", 0) or 0)
-    win_rate = (won_trades / total_trades * 100) if total_trades > 0 else 0.0
-
-    if include_details:
-        equity_curve = pd.DataFrame(result.analyzers.equity.get_analysis(), columns=["datetime", "equity"])
-        if not equity_curve.empty:
-            equity_curve["datetime"] = pd.to_datetime(equity_curve["datetime"])
-
-        trade_details = pd.DataFrame(result.analyzers.trade_details.get_analysis())
-        if not trade_details.empty:
-            trade_details["开仓时间"] = pd.to_datetime(trade_details["开仓时间"])
-            trade_details["平仓时间"] = pd.to_datetime(trade_details["平仓时间"])
-            trade_details = trade_details.sort_values(by="开仓时间").reset_index(drop=True)
-    else:
-        equity_curve = pd.DataFrame(columns=["datetime", "equity"])
-        trade_details = pd.DataFrame()
-
-    metrics = {
-        "初始资金": round(initial_cash, 2),
-        "最终资金": round(final_value, 2),
-        "总收益率(%)": round(total_return, 2),
-        "年化收益率(%)": round(float(returns_data.get("rnorm100", 0.0) or 0.0), 2),
-        "Sharpe": None if sharpe_data.get("sharperatio") is None else round(float(sharpe_data["sharperatio"]), 4),
-        "最大回撤(%)": round(float(drawdown_data.get("max", {}).get("drawdown", 0.0) or 0.0), 2),
-        "总交易次数": total_trades,
-        "盈利次数": won_trades,
-        "亏损次数": lost_trades,
-        "胜率(%)": round(win_rate, 2),
-    }
-
-    return BacktestResult(metrics=metrics, equity_curve=equity_curve, trade_details=trade_details)
-
-
-def run_backtest(
-    df: pd.DataFrame,
-    strategy_cls,
-    strategy_params: dict[str, Any],
-    initial_cash: float = 10_000,
-    commission: float = 0.001,
-    position_percent: float = 95,
-    leverage: float = 1.0,
-    include_details: bool = True,
-) -> BacktestResult:
-    leverage = float(leverage)
-    if leverage <= 0:
-        raise ValueError("leverage 必须大于 0")
-
-    position_percent = float(position_percent)
-    if position_percent <= 0:
-        raise ValueError("position_percent 必须大于 0")
-
-    engine_pref = str(os.getenv("AUTOTRADE_BACKTEST_ENGINE", "auto")).strip().lower()
-    if engine_pref not in {"vectorbt", "backtrader", "auto"}:
-        engine_pref = "auto"
-
-    strategy_name = str(getattr(strategy_cls, "__name__", "") or "")
-    has_vectorbt_runner = strategy_name in _VECTORBT_STRATEGY_RUNNERS
-
-    if engine_pref == "backtrader":
-        return _run_backtest_backtrader(
-            df=df,
-            strategy_cls=strategy_cls,
-            strategy_params=strategy_params,
-            initial_cash=initial_cash,
-            commission=commission,
-            position_percent=position_percent,
-            leverage=leverage,
-            include_details=include_details,
-        )
-
-    if has_vectorbt_runner:
-        try:
-            return _run_backtest_vectorbt(
-                df=df,
-                strategy_cls=strategy_cls,
-                strategy_params=strategy_params,
-                initial_cash=initial_cash,
-                commission=commission,
-                position_percent=position_percent,
-                leverage=leverage,
-                include_details=include_details,
-            )
-        except Exception:
-            if engine_pref == "vectorbt":
-                raise
-
-    if engine_pref == "vectorbt" and not has_vectorbt_runner:
-        raise ValueError(f"策略 {strategy_name} 暂未接入 vectorbt 引擎，请切换 AUTOTRADE_BACKTEST_ENGINE=auto/backtrader")
-
-    return _run_backtest_backtrader(
-        df=df,
-        strategy_cls=strategy_cls,
-        strategy_params=strategy_params,
-        initial_cash=initial_cash,
-        commission=commission,
-        position_percent=position_percent,
-        leverage=leverage,
-        include_details=include_details,
-    )

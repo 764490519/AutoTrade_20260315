@@ -1,6 +1,5 @@
 ﻿from __future__ import annotations
 
-import inspect
 import itertools
 import json
 import os
@@ -8,10 +7,10 @@ from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_compl
 from dataclasses import dataclass
 from typing import Any
 
-import backtrader as bt
 import pandas as pd
 
 from backtest_engine import BacktestResult, run_backtest
+from strategy_loader import compile_strategy_runtime_from_code
 
 try:
     import optuna
@@ -194,6 +193,8 @@ def _eval_one_local(
     commission: float,
     position_percent: float,
     leverage: float,
+    position_sizing_mode: str,
+    fixed_trade_amount: float | None,
     objective: str,
 ) -> dict[str, Any]:
     try:
@@ -206,6 +207,8 @@ def _eval_one_local(
             position_percent=position_percent,
             leverage=leverage,
             include_details=False,
+            position_sizing_mode=position_sizing_mode,
+            fixed_trade_amount=fixed_trade_amount,
         )
         return _build_success_row(params, result.metrics, objective)
     except Exception as exc:  # noqa: BLE001
@@ -213,23 +216,16 @@ def _eval_one_local(
 
 
 def _compile_strategy_from_code(strategy_code: str, strategy_class_name: str | None = None):
-    code = str(strategy_code or "").lstrip("\ufeff")
-    namespace: dict[str, Any] = {"bt": bt}
-    exec(code, namespace, namespace)
-
-    if strategy_class_name:
+    runtime = compile_strategy_runtime_from_code(strategy_code)
+    if strategy_class_name and getattr(runtime.strategy_obj, "__name__", None) != strategy_class_name:
+        # 指定了策略名但与实际解析不同，尝试按名称再取一次（兼容 strategy_class）
+        code = str(strategy_code or "").lstrip("\ufeff")
+        namespace: dict[str, Any] = {}
+        exec(code, namespace, namespace)
         maybe = namespace.get(strategy_class_name)
-        if inspect.isclass(maybe) and issubclass(maybe, bt.Strategy):
+        if maybe is not None:
             return maybe
-
-    strategy_classes = [
-        obj
-        for obj in namespace.values()
-        if inspect.isclass(obj) and issubclass(obj, bt.Strategy) and obj is not bt.Strategy
-    ]
-    if not strategy_classes:
-        raise ValueError("策略代码中未找到 bt.Strategy 子类")
-    return strategy_classes[0]
+    return runtime.strategy_obj
 
 
 def _mp_worker_init(df: pd.DataFrame, strategy_code: str, strategy_class_name: str | None = None) -> None:
@@ -244,6 +240,8 @@ def _mp_eval_one(
     commission: float,
     position_percent: float,
     leverage: float,
+    position_sizing_mode: str,
+    fixed_trade_amount: float | None,
     objective: str,
 ) -> dict[str, Any]:
     global _MP_DF, _MP_STRATEGY_CLS
@@ -258,6 +256,8 @@ def _mp_eval_one(
         commission=commission,
         position_percent=position_percent,
         leverage=leverage,
+        position_sizing_mode=position_sizing_mode,
+        fixed_trade_amount=fixed_trade_amount,
         objective=objective,
     )
 
@@ -270,6 +270,8 @@ def optimize_parameters(
     commission: float,
     position_percent: float,
     leverage: float = 1.0,
+    position_sizing_mode: str = "percent_equity",
+    fixed_trade_amount: float | None = None,
     objective: str = "Sharpe",
     max_combinations: int = 80,
     n_jobs: int = 1,
@@ -298,6 +300,8 @@ def optimize_parameters(
                     commission=commission,
                     position_percent=position_percent,
                     leverage=leverage,
+                    position_sizing_mode=position_sizing_mode,
+                    fixed_trade_amount=fixed_trade_amount,
                     objective=objective,
                 )
             )
@@ -325,6 +329,8 @@ def optimize_parameters(
                             float(commission),
                             float(position_percent),
                             float(leverage),
+                            str(position_sizing_mode),
+                            None if fixed_trade_amount is None else float(fixed_trade_amount),
                             str(objective),
                         ): params
                         for params in combos
@@ -357,6 +363,8 @@ def optimize_parameters(
                         commission=commission,
                         position_percent=position_percent,
                         leverage=leverage,
+                        position_sizing_mode=position_sizing_mode,
+                        fixed_trade_amount=fixed_trade_amount,
                         objective=objective,
                     ): params
                     for params in combos
@@ -391,6 +399,8 @@ def run_walk_forward(
     commission: float,
     position_percent: float,
     leverage: float = 1.0,
+    position_sizing_mode: str = "percent_equity",
+    fixed_trade_amount: float | None = None,
     objective: str = "Sharpe",
     folds: int = 4,
     max_combinations: int = 80,
@@ -429,6 +439,8 @@ def run_walk_forward(
                 commission=commission,
                 position_percent=position_percent,
                 leverage=leverage,
+                position_sizing_mode=position_sizing_mode,
+                fixed_trade_amount=fixed_trade_amount,
                 objective=objective,
                 max_combinations=max_combinations,
                 n_jobs=n_jobs,
@@ -478,6 +490,8 @@ def run_walk_forward(
                 position_percent=position_percent,
                 leverage=leverage,
                 include_details=False,
+                position_sizing_mode=position_sizing_mode,
+                fixed_trade_amount=fixed_trade_amount,
             )
             oos_return = oos_res.metrics.get("总收益率(%)")
             oos_sharpe = oos_res.metrics.get("Sharpe")
@@ -589,6 +603,8 @@ def optimize_parameters_optuna(
     commission: float,
     position_percent: float,
     leverage: float = 1.0,
+    position_sizing_mode: str = "percent_equity",
+    fixed_trade_amount: float | None = None,
     objective: str = "Sharpe",
     n_trials: int = 80,
     sampler_name: str = "TPE",
@@ -623,6 +639,8 @@ def optimize_parameters_optuna(
                 position_percent=position_percent,
                 leverage=leverage,
                 include_details=False,
+                position_sizing_mode=position_sizing_mode,
+                fixed_trade_amount=fixed_trade_amount,
             )
 
             metrics = result.metrics
@@ -699,6 +717,8 @@ def run_walk_forward_optuna(
     commission: float,
     position_percent: float,
     leverage: float = 1.0,
+    position_sizing_mode: str = "percent_equity",
+    fixed_trade_amount: float | None = None,
     objective: str = "Sharpe",
     folds: int = 4,
     n_trials: int = 80,
@@ -737,6 +757,8 @@ def run_walk_forward_optuna(
                 commission=commission,
                 position_percent=position_percent,
                 leverage=leverage,
+                position_sizing_mode=position_sizing_mode,
+                fixed_trade_amount=fixed_trade_amount,
                 objective=objective,
                 n_trials=n_trials,
                 sampler_name=sampler_name,
@@ -787,6 +809,8 @@ def run_walk_forward_optuna(
                 position_percent=position_percent,
                 leverage=leverage,
                 include_details=False,
+                position_sizing_mode=position_sizing_mode,
+                fixed_trade_amount=fixed_trade_amount,
             )
             oos_return = oos_res.metrics.get("总收益率(%)")
             oos_sharpe = oos_res.metrics.get("Sharpe")

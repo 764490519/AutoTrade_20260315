@@ -1,10 +1,8 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
-import os
 import sys
 from pathlib import Path
 
-import backtrader as bt
 import numpy as np
 import pandas as pd
 
@@ -12,7 +10,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from backtest_engine import run_backtest
+from backtest_engine import infer_latest_signal, run_backtest
 from optimization_engine import (
     optimize_parameters,
     optimize_parameters_optuna,
@@ -44,11 +42,9 @@ def _ret(m: dict) -> float:
 
 
 def _run_vectorbt_smoke() -> None:
-    print("[VBT-QA] vectorbt migration smoke start")
-    os.environ["AUTOTRADE_BACKTEST_ENGINE"] = "vectorbt"
+    print("[VBT-QA] vectorbt-only smoke start")
     df = _build_df()
 
-    # 1) 三个已接入策略应可正常运行
     res_faber = run_backtest(
         df,
         FaberMaTrendStrategy,
@@ -86,19 +82,16 @@ def _run_vectorbt_smoke() -> None:
             "stop_atr_mult": 2.0,
             "trail_atr_mult": 2.0,
             "can_short": 1,
-            "target_percent": 0.6,
         },
         initial_cash=10_000,
         commission=0.0004,
-        position_percent=95,  # donchian 中由 target_percent 控制
+        position_percent=95,
         leverage=1.0,
         include_details=True,
     )
     assert not res_don.equity_curve.empty, "donchian equity empty"
-
     print("[VBT-QA] strategies run ok")
 
-    # 2) 杠杆应生效（fast_rsi）
     base_params = {
         "rsi_period": 12,
         "up": 53,
@@ -109,46 +102,12 @@ def _run_vectorbt_smoke() -> None:
         "cooldown": 8,
         "can_short": 1,
     }
-    r1 = _ret(
-        run_backtest(
-            df,
-            FastRsiFlipStrategy,
-            base_params,
-            initial_cash=10_000,
-            commission=0.0004,
-            position_percent=20,
-            leverage=1.0,
-            include_details=False,
-        ).metrics
-    )
-    r2 = _ret(
-        run_backtest(
-            df,
-            FastRsiFlipStrategy,
-            base_params,
-            initial_cash=10_000,
-            commission=0.0004,
-            position_percent=20,
-            leverage=2.0,
-            include_details=False,
-        ).metrics
-    )
-    r3 = _ret(
-        run_backtest(
-            df,
-            FastRsiFlipStrategy,
-            base_params,
-            initial_cash=10_000,
-            commission=0.0004,
-            position_percent=20,
-            leverage=3.0,
-            include_details=False,
-        ).metrics
-    )
+    r1 = _ret(run_backtest(df, FastRsiFlipStrategy, base_params, 10_000, 0.0004, 20, 1.0, False).metrics)
+    r2 = _ret(run_backtest(df, FastRsiFlipStrategy, base_params, 10_000, 0.0004, 20, 2.0, False).metrics)
+    r3 = _ret(run_backtest(df, FastRsiFlipStrategy, base_params, 10_000, 0.0004, 20, 3.0, False).metrics)
     assert r1 < r2 < r3, f"vectorbt leverage monotonic failed: {r1}, {r2}, {r3}"
     print(f"[VBT-QA] leverage ok: {r1:.2f} < {r2:.2f} < {r3:.2f}")
 
-    # 3) 网格优化 + walk-forward
     grid = optimize_parameters(
         df=df,
         strategy_cls=FastRsiFlipStrategy,
@@ -180,7 +139,6 @@ def _run_vectorbt_smoke() -> None:
     assert len(wf_df) > 0 and int(wf_summary.get("folds", 0)) > 0, "vectorbt walk-forward failed"
     print(f"[VBT-QA] walk-forward ok: folds={wf_summary.get('folds')}")
 
-    # 4) Optuna + WalkForward Optuna
     schema = {
         "rsi_period": {"type": "int", "min": 6, "max": 16, "step": 1},
         "up": {"type": "int", "min": 52, "max": 60, "step": 1},
@@ -226,25 +184,26 @@ def _run_vectorbt_smoke() -> None:
     assert len(wf_opt_df) > 0 and int(wf_opt_summary.get("folds", 0)) > 0, "vectorbt wf-optuna failed"
     print(f"[VBT-QA] walk-forward optuna ok: folds={wf_opt_summary.get('folds')}")
 
-    # 5) 不支持的策略在 auto 模式应回退 backtrader
-    class BuyHold(bt.Strategy):
-        def next(self):
-            if not self.position:
-                self.buy()
-
-    os.environ["AUTOTRADE_BACKTEST_ENGINE"] = "auto"
-    fallback_res = run_backtest(
-        df=df,
-        strategy_cls=BuyHold,
-        strategy_params={},
-        initial_cash=10_000,
-        commission=0.0,
+    # 核对“信号推断”与回测状态一致性
+    sig = infer_latest_signal(
+        df,
+        strategy_cls=DonchianChannelBreakoutStrategy,
+        strategy_params={
+            "entry_period": 30,
+            "exit_period": 12,
+            "atr_period": 14,
+            "atr_filter_enabled": 0,
+            "atr_ratio_min": 0.001,
+            "atr_ratio_max": 0.08,
+            "stop_atr_mult": 2.0,
+            "trail_atr_mult": 2.0,
+            "can_short": 1,
+        },
         position_percent=95,
-        leverage=2.0,
-        include_details=False,
     )
-    assert "总收益率(%)" in fallback_res.metrics, "fallback backtest failed"
-    print("[VBT-QA] auto fallback to backtrader ok")
+    assert sig["signal"] in {"LONG", "SHORT", "FLAT"}
+    print("[VBT-QA] signal inference ok")
+
     print("[VBT-QA] all tests passed")
 
 

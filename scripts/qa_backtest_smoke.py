@@ -1,11 +1,10 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import sys
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import backtrader as bt
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
@@ -13,6 +12,57 @@ if str(ROOT_DIR) not in sys.path:
 
 from backtest_engine import run_backtest
 from optimization_engine import optimize_parameters, run_walk_forward
+
+
+class BuyHold:
+    USE_GLOBAL_POSITION_PERCENT = True
+
+    @staticmethod
+    def generate_targets(df: pd.DataFrame, params: dict):
+        n = len(df)
+        t = np.full(n, np.nan)
+        if n > 1:
+            t[1] = 1.0
+        return t
+
+
+class ShortHold:
+    USE_GLOBAL_POSITION_PERCENT = True
+
+    @staticmethod
+    def generate_targets(df: pd.DataFrame, params: dict):
+        n = len(df)
+        t = np.full(n, np.nan)
+        if n > 1:
+            t[1] = -1.0
+        return t
+
+
+class SmaCross:
+    USE_GLOBAL_POSITION_PERCENT = True
+
+    @staticmethod
+    def generate_targets(df: pd.DataFrame, params: dict):
+        fast = int(params.get("fast", 10))
+        slow = int(params.get("slow", 30))
+        close = pd.to_numeric(df["close"], errors="coerce").astype(float)
+        f = close.rolling(window=fast, min_periods=fast).mean()
+        s = close.rolling(window=slow, min_periods=slow).mean()
+        n = len(df)
+        t = np.full(n, np.nan)
+        pos = 0
+        for i in range(slow + 1, n):
+            fv = float(f.iloc[i - 1])
+            sv = float(s.iloc[i - 1])
+            if not np.isfinite(fv) or not np.isfinite(sv):
+                continue
+            if pos == 0 and fv > sv:
+                t[i] = 1.0
+                pos = 1
+            elif pos == 1 and fv < sv:
+                t[i] = 0.0
+                pos = 0
+        return t
 
 
 def _build_trend_df(*, n: int = 800, up: bool = True) -> pd.DataFrame:
@@ -30,34 +80,6 @@ def _build_trend_df(*, n: int = 800, up: bool = True) -> pd.DataFrame:
     )
 
 
-class BuyHold(bt.Strategy):
-    def next(self):
-        if not self.position:
-            self.buy()
-
-
-class ShortHold(bt.Strategy):
-    def next(self):
-        if not self.position:
-            self.sell()
-
-
-class SmaCross(bt.Strategy):
-    params = (("fast", 10), ("slow", 30))
-
-    def __init__(self):
-        self.fast = bt.ind.SMA(self.data.close, period=int(self.p.fast))
-        self.slow = bt.ind.SMA(self.data.close, period=int(self.p.slow))
-
-    def next(self):
-        if len(self.data) < int(self.p.slow) + 1:
-            return
-        if not self.position and float(self.fast[-1]) > float(self.slow[-1]):
-            self.buy()
-        elif self.position and float(self.fast[-1]) < float(self.slow[-1]):
-            self.close()
-
-
 def _metric_return(result) -> float:
     return float(result.metrics.get("总收益率(%)", 0.0))
 
@@ -68,7 +90,6 @@ def main() -> None:
     up_df = _build_trend_df(up=True)
     dn_df = _build_trend_df(up=False)
 
-    # 1) leverage sensitivity (long)
     r1 = _metric_return(
         run_backtest(up_df, BuyHold, {}, initial_cash=10_000, commission=0.0, position_percent=95, leverage=1.0, include_details=False)
     )
@@ -81,7 +102,6 @@ def main() -> None:
     assert r1 < r2 < r3, f"leverage-long monotonic failed: {r1}, {r2}, {r3}"
     print(f"[QA] leverage-long ok: {r1:.2f} < {r2:.2f} < {r3:.2f}")
 
-    # 2) leverage sensitivity (short)
     s1 = _metric_return(
         run_backtest(dn_df, ShortHold, {}, initial_cash=10_000, commission=0.0, position_percent=95, leverage=1.0, include_details=False)
     )
@@ -94,7 +114,6 @@ def main() -> None:
     assert s1 < s2 < s3, f"leverage-short monotonic failed: {s1}, {s2}, {s3}"
     print(f"[QA] leverage-short ok: {s1:.2f} < {s2:.2f} < {s3:.2f}")
 
-    # 3) include_details
     detail = run_backtest(
         up_df,
         SmaCross,
@@ -109,7 +128,6 @@ def main() -> None:
     assert {"datetime", "equity"}.issubset(set(detail.equity_curve.columns)), "equity columns missing"
     print(f"[QA] include_details ok: equity_rows={len(detail.equity_curve)} trade_rows={len(detail.trade_details)}")
 
-    # 4) optimization grid
     grid = optimize_parameters(
         up_df,
         SmaCross,
@@ -126,7 +144,6 @@ def main() -> None:
     assert isinstance(grid.best_params, dict), "grid best_params invalid"
     print(f"[QA] grid optimize ok: rows={len(grid.ranking)} best={grid.best_params}")
 
-    # 5) walk-forward basic
     wf_df, wf_summary = run_walk_forward(
         up_df,
         SmaCross,
@@ -144,28 +161,39 @@ def main() -> None:
     assert int(wf_summary.get("folds", 0)) > 0, "walk-forward summary invalid"
     print(f"[QA] walk-forward ok: folds={wf_summary.get('folds')} rows={len(wf_df)}")
 
-    # 6) process-pool optimization path (strategy_code enabled)
     strategy_code = """
-import backtrader as bt
+import numpy as np
+import pandas as pd
 
-class SmaCrossFromCode(bt.Strategy):
-    params = (("fast", 10), ("slow", 30))
+class SmaCrossFromCode:
+    USE_GLOBAL_POSITION_PERCENT = True
 
-    def __init__(self):
-        self.fast = bt.ind.SMA(self.data.close, period=int(self.p.fast))
-        self.slow = bt.ind.SMA(self.data.close, period=int(self.p.slow))
-
-    def next(self):
-        if len(self.data) < int(self.p.slow) + 1:
-            return
-        if not self.position and float(self.fast[-1]) > float(self.slow[-1]):
-            self.buy()
-        elif self.position and float(self.fast[-1]) < float(self.slow[-1]):
-            self.close()
+    @staticmethod
+    def generate_targets(df: pd.DataFrame, params: dict):
+        fast = int(params.get('fast', 10))
+        slow = int(params.get('slow', 30))
+        close = pd.to_numeric(df['close'], errors='coerce').astype(float)
+        f = close.rolling(window=fast, min_periods=fast).mean()
+        s = close.rolling(window=slow, min_periods=slow).mean()
+        n = len(df)
+        t = np.full(n, np.nan)
+        pos = 0
+        for i in range(slow + 1, n):
+            fv = float(f.iloc[i - 1])
+            sv = float(s.iloc[i - 1])
+            if not np.isfinite(fv) or not np.isfinite(sv):
+                continue
+            if pos == 0 and fv > sv:
+                t[i] = 1.0
+                pos = 1
+            elif pos == 1 and fv < sv:
+                t[i] = 0.0
+                pos = 0
+        return t
 """
     mp_grid = optimize_parameters(
         up_df,
-        SmaCross,  # 实际会被 strategy_code 覆盖，保留占位
+        SmaCross,
         param_grid={"fast": [8, 12], "slow": [30, 50]},
         initial_cash=10_000,
         commission=0.001,

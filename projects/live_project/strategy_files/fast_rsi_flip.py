@@ -1,48 +1,81 @@
-import backtrader as bt
+"""
+?????Fast RSI Flip?EMA + ATR?
+
+?????
+- ?? RSI ???? + EMA ?????????????
+- ?????? K ??????????? K ???????????????
+- ?? ATR ????/????????????????
+
+???????
+1) ????????
+   - ???close[-1] > EMA[-1] ? RSI[-1] > up
+   - ???close[-1] < EMA[-1] ? RSI[-1] < dn?can_short=1?
+2) ????????
+   - ATR ???? + ATR ???? + RSI ??????
+3) ?????
+   - ?? bar(i) ????????? bar(i-1) ?????????? bar(i) ? open?
+
+???????
+- rsi_period?RSI ??
+- up / dn?RSI ??/??????? 0 < dn < up < 100?
+- ema_period?????????
+- atr_period?ATR ??
+- stop_atr / take_atr???/?? ATR ??
+- cooldown?????? bar ?
+- can_short????????1=???0=????
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+import numpy as np
+import pandas as pd
 
 STRATEGY_META = {
-    "display_name": "Fast RSI Flip（EMA+ATR）",
+    "display_name": "Fast RSI Flip?EMA+ATR?",
     "strategy_class": "FastRsiFlipStrategy",
+    "signal_func": "generate_targets",
     "params": {
         "rsi_period": {
             "type": "int",
-            "default": 12,
-            "min": 3,
-            "max": 30,
+            "default": 36,
+            "min": 4,
+            "max": 60,
             "step": 1,
-            "desc": "RSI 周期。",
+            "desc": "RSI ?????",
         },
         "up": {
             "type": "int",
-            "default": 53,
+            "default": 65,
             "min": 50,
-            "max": 90,
+            "max": 95,
             "step": 1,
-            "desc": "做多阈值：RSI 高于该值才允许开多。",
+            "desc": "RSI ?????????????????????",
         },
         "dn": {
             "type": "int",
-            "default": 36,
-            "min": 10,
+            "default": 31,
+            "min": 5,
             "max": 50,
             "step": 1,
-            "desc": "做空阈值：RSI 低于该值才允许开空。",
+            "desc": "RSI ?????????????????????",
         },
         "ema_period": {
             "type": "int",
-            "default": 66,
-            "min": 5,
-            "max": 300,
+            "default": 186,
+            "min": 20,
+            "max": 500,
             "step": 1,
-            "desc": "趋势过滤 EMA 周期。",
+            "desc": "EMA ???????",
         },
         "atr_period": {
             "type": "int",
-            "default": 26,
-            "min": 2,
+            "default": 38,
+            "min": 5,
             "max": 120,
             "step": 1,
-            "desc": "ATR 周期。",
+            "desc": "ATR ?????",
         },
         "stop_atr": {
             "type": "float",
@@ -50,15 +83,23 @@ STRATEGY_META = {
             "min": 0.1,
             "max": 10.0,
             "step": 0.1,
-            "desc": "固定止损 ATR 倍数。",
+            "desc": "???? ATR ???",
+        },
+        "take_atr": {
+            "type": "float",
+            "default": 5.8,
+            "min": 0.1,
+            "max": 15.0,
+            "step": 0.1,
+            "desc": "???? ATR ???",
         },
         "cooldown": {
             "type": "int",
-            "default": 12,
+            "default": 71,
             "min": 0,
-            "max": 240,
+            "max": 500,
             "step": 1,
-            "desc": "平仓后冷却 bar 数，冷却期内不再开仓。",
+            "desc": "?????? bar ??",
         },
         "can_short": {
             "type": "int",
@@ -66,120 +107,150 @@ STRATEGY_META = {
             "min": 0,
             "max": 1,
             "step": 1,
-            "desc": "是否允许做空：1=允许，0=仅做多。",
+            "desc": "???????1=???0=????",
         },
     },
 }
 
 
-class FastRsiFlipStrategy(bt.Strategy):
-    """
-    快速切换策略（Long/Short）：
-    1) 趋势 + 动量开仓
-       - 开多：close > EMA 且 RSI > up
-       - 开空：close < EMA 且 RSI < dn（can_short=1）
-    2) 持仓出场
-       - 多头：close < 入场价 - 入场ATR*stop_atr 或 RSI < dn
-       - 空头：close > 入场价 + 入场ATR*stop_atr 或 RSI > up
-    3) 冷却机制
-       - 平仓后 cooldown 根K线内不再开仓
+def _ema(series: pd.Series, period: int) -> pd.Series:
+    return series.ewm(span=period, adjust=False, min_periods=period).mean()
 
-    为避免未来函数，信号使用上一根指标值（[-1]）。
-    """
 
-    params = (
-        ("rsi_period", 12),
-        ("up", 53),
-        ("dn", 36),
-        ("ema_period", 66),
-        ("atr_period", 26),
-        ("stop_atr", 0.5),
-        ("cooldown", 12),
-        ("can_short", 1),
-    )
+def _atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int) -> pd.Series:
+    prev_close = close.shift(1)
+    tr = pd.concat(
+        [
+            (high - low).abs(),
+            (high - prev_close).abs(),
+            (low - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    return tr.ewm(alpha=1.0 / float(period), adjust=False, min_periods=period).mean()
 
-    def __init__(self):
-        self.rsi_period = int(self.p.rsi_period)
-        self.up = float(self.p.up)
-        self.dn = float(self.p.dn)
-        self.ema_period = int(self.p.ema_period)
-        self.atr_period = int(self.p.atr_period)
-        self.stop_atr = float(self.p.stop_atr)
-        self.cooldown = int(self.p.cooldown)
-        self.can_short = bool(int(self.p.can_short))
 
-        if self.rsi_period < 2 or self.ema_period < 2 or self.atr_period < 2:
-            raise ValueError("rsi_period / ema_period / atr_period 必须 >= 2")
-        if self.stop_atr <= 0:
-            raise ValueError("stop_atr 必须 > 0")
-        if self.cooldown < 0:
-            raise ValueError("cooldown 必须 >= 0")
-        if not (0 < self.dn < self.up < 100):
-            raise ValueError("参数约束必须满足：0 < dn < up < 100")
+def _rsi(close: pd.Series, period: int) -> pd.Series:
+    delta = close.diff()
+    gain = delta.clip(lower=0.0)
+    loss = (-delta).clip(lower=0.0)
 
-        # 使用 RSI_Safe 避免在单边行情中出现除零异常
-        self.rsi = bt.indicators.RSI_Safe(self.data.close, period=self.rsi_period)
-        self.ema = bt.indicators.EMA(self.data.close, period=self.ema_period)
-        self.atr = bt.indicators.ATR(self.data, period=self.atr_period)
+    avg_gain = gain.ewm(alpha=1.0 / float(period), adjust=False, min_periods=period).mean()
+    avg_loss = loss.ewm(alpha=1.0 / float(period), adjust=False, min_periods=period).mean()
 
-        self.pending_order = None
-        self.entry_price = None
-        self.entry_atr = None
-        self.last_flat_bar = -10**9
+    rs = avg_gain / avg_loss.replace(0.0, np.nan)
+    out = 100.0 - (100.0 / (1.0 + rs))
+    out = out.where(avg_loss > 0.0, 100.0)
+    both_zero = (avg_gain <= 0.0) & (avg_loss <= 0.0)
+    return out.where(~both_zero, 50.0)
 
-    def notify_order(self, order):
-        if order.status in [order.Submitted, order.Accepted]:
-            return
-        if order.status in [order.Completed, order.Canceled, order.Margin, order.Rejected]:
-            self.pending_order = None
 
-        if order.status == order.Completed:
-            if self.position.size != 0:
-                self.entry_price = float(self.position.price)
-                try:
-                    self.entry_atr = float(self.atr[-1])
-                except Exception:  # noqa: BLE001
-                    self.entry_atr = float(self.atr[0])
-            else:
-                self.entry_price = None
-                self.entry_atr = None
-                self.last_flat_bar = len(self.data)
+def generate_targets(df: pd.DataFrame, params: dict[str, Any]) -> np.ndarray:
+    rsi_period = int(params.get("rsi_period", 36))
+    up = float(params.get("up", 65))
+    dn = float(params.get("dn", 31))
+    ema_period = int(params.get("ema_period", 186))
+    atr_period = int(params.get("atr_period", 38))
+    stop_atr = float(params.get("stop_atr", 0.5))
+    take_atr = float(params.get("take_atr", 5.8))
+    cooldown = int(params.get("cooldown", 71))
+    can_short = bool(int(params.get("can_short", 1)))
 
-    def next(self):
-        need_bars = max(self.rsi_period, self.ema_period, self.atr_period) + 1
-        if len(self.data) < need_bars:
-            return
-        if self.pending_order is not None:
-            return
+    if rsi_period < 2 or ema_period < 2 or atr_period < 2:
+        raise ValueError("rsi_period / ema_period / atr_period ?? >= 2")
+    if stop_atr <= 0 or take_atr <= 0:
+        raise ValueError("stop_atr / take_atr ?? > 0")
+    if cooldown < 0:
+        raise ValueError("cooldown ?? >= 0")
+    if not (0 < dn < up < 100):
+        raise ValueError("?????????0 < dn < up < 100")
 
-        close_now = float(self.data.close[0])
-        ema_prev = float(self.ema[-1])
-        rsi_prev = float(self.rsi[-1])
+    close = pd.to_numeric(df["close"], errors="coerce").astype(float)
+    open_ = pd.to_numeric(df["open"], errors="coerce").astype(float)
+    high = pd.to_numeric(df["high"], errors="coerce").astype(float)
+    low = pd.to_numeric(df["low"], errors="coerce").astype(float)
 
-        # 持仓先处理平仓
-        if self.position.size > 0:
-            atr_used = float(self.entry_atr) if self.entry_atr is not None else float(self.atr[-1])
-            stop_price = float(self.entry_price) - atr_used * self.stop_atr
-            if close_now < stop_price or rsi_prev < self.dn:
-                self.pending_order = self.close()
-            return
+    ema = _ema(close, ema_period)
+    rsi = _rsi(close, rsi_period)
+    atr = _atr(high, low, close, atr_period)
 
-        if self.position.size < 0:
-            atr_used = float(self.entry_atr) if self.entry_atr is not None else float(self.atr[-1])
-            stop_price = float(self.entry_price) + atr_used * self.stop_atr
-            if close_now > stop_price or rsi_prev > self.up:
-                self.pending_order = self.close()
-            return
+    n = len(df)
+    targets = np.full(n, np.nan, dtype=float)
 
-        # 空仓冷却期
-        if len(self.data) - int(self.last_flat_bar) <= self.cooldown:
-            return
+    pos = 0
+    entry_price: float | None = None
+    entry_atr: float | None = None
+    last_flat_bar = -10**9
 
-        # 空仓开仓
-        if close_now > ema_prev and rsi_prev > self.up:
-            self.pending_order = self.buy()
-            return
+    need_bars = max(rsi_period, ema_period, atr_period) + 2
+    for i in range(n):
+        if i < need_bars:
+            continue
 
-        if self.can_short and close_now < ema_prev and rsi_prev < self.dn:
-            self.pending_order = self.sell()
-            return
+        close_prev = float(close.iloc[i - 1])
+        open_now = float(open_.iloc[i])
+        ema_prev = float(ema.iloc[i - 1])
+        rsi_prev = float(rsi.iloc[i - 1])
+        atr_prev = float(atr.iloc[i - 1])
+
+        if not (
+            np.isfinite(close_prev)
+            and np.isfinite(open_now)
+            and np.isfinite(ema_prev)
+            and np.isfinite(rsi_prev)
+            and np.isfinite(atr_prev)
+        ):
+            continue
+
+        if pos > 0:
+            atr_used = float(entry_atr) if entry_atr is not None else atr_prev
+            stop_price = float(entry_price) - atr_used * stop_atr
+            take_price = float(entry_price) + atr_used * take_atr
+            if close_prev <= stop_price or close_prev >= take_price or rsi_prev < dn:
+                targets[i] = 0.0
+                pos = 0
+                entry_price = None
+                entry_atr = None
+                last_flat_bar = i
+            continue
+
+        if pos < 0:
+            atr_used = float(entry_atr) if entry_atr is not None else atr_prev
+            stop_price = float(entry_price) + atr_used * stop_atr
+            take_price = float(entry_price) - atr_used * take_atr
+            if close_prev >= stop_price or close_prev <= take_price or rsi_prev > up:
+                targets[i] = 0.0
+                pos = 0
+                entry_price = None
+                entry_atr = None
+                last_flat_bar = i
+            continue
+
+        if i - last_flat_bar <= cooldown:
+            continue
+
+        if close_prev > ema_prev and rsi_prev > up:
+            targets[i] = 1.0
+            pos = 1
+            entry_price = open_now
+            entry_atr = atr_prev
+            continue
+
+        if can_short and close_prev < ema_prev and rsi_prev < dn:
+            targets[i] = -1.0
+            pos = -1
+            entry_price = open_now
+            entry_atr = atr_prev
+            continue
+
+    return targets
+
+
+class FastRsiFlipStrategy:
+    """?????????????? generate_targets ????"""
+
+    USE_GLOBAL_POSITION_PERCENT = True
+
+    @staticmethod
+    def generate_targets(df: pd.DataFrame, params: dict[str, Any]) -> np.ndarray:
+        return generate_targets(df, params)

@@ -1,7 +1,9 @@
 ﻿from __future__ import annotations
 
+import os
 import time
-from datetime import datetime
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
 
 import pandas as pd
@@ -35,6 +37,14 @@ INTERVAL_TO_MS = {
 
 class BinanceDataError(RuntimeError):
     pass
+
+
+def _normalize_utc_dt(value: Optional[datetime]) -> Optional[datetime]:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
 
 
 def _to_ms(value: Optional[datetime]) -> Optional[int]:
@@ -99,7 +109,47 @@ def _request_klines_with_retry(
     )
 
 
-def fetch_klines(
+def _cache_file_path(symbol: str, interval: str) -> Path:
+    env_dir = str(os.getenv("AUTOTRADE_KLINE_CACHE_DIR", "")).strip()
+    if env_dir:
+        base = Path(env_dir).expanduser().resolve()
+    else:
+        base = Path(__file__).resolve().parent / "reports" / "kline_cache"
+    base.mkdir(parents=True, exist_ok=True)
+    return base / f"{symbol}_{interval}.csv"
+
+
+def _load_cached_klines(path: Path) -> pd.DataFrame:
+    if not path.exists():
+        return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
+
+    try:
+        df = pd.read_csv(path)
+    except Exception:  # noqa: BLE001
+        return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
+
+    required_cols = {"open_time", "open", "high", "low", "close", "volume"}
+    if not required_cols.issubset(set(df.columns)):
+        return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
+
+    df["open_time"] = pd.to_datetime(df["open_time"], utc=True, errors="coerce")
+    df = df.dropna(subset=["open_time"]).set_index("open_time")
+    for col in ["open", "high", "low", "close", "volume"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = df[["open", "high", "low", "close", "volume"]].dropna()
+    df = df[~df.index.duplicated(keep="last")].sort_index()
+    return df
+
+
+def _save_cached_klines(path: Path, df: pd.DataFrame) -> None:
+    out = df[["open", "high", "low", "close", "volume"]].copy()
+    out = out[~out.index.duplicated(keep="last")].sort_index()
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    out.to_csv(tmp_path, index=True, index_label="open_time")
+    tmp_path.replace(path)
+
+
+def _fetch_klines_remote(
     symbol: str,
     interval: str,
     start_time: Optional[datetime] = None,
@@ -109,10 +159,13 @@ def fetch_klines(
     max_retries: int = 5,
     retry_delay: float = 0.4,
 ) -> pd.DataFrame:
-    """拉取币安K线并转为DataFrame(index=datetime)。"""
+    """仅从 Binance API 拉取K线并转为DataFrame(index=datetime)。"""
     symbol = symbol.upper().strip()
     if interval not in INTERVAL_TO_MS:
         raise BinanceDataError(f"不支持的 interval: {interval}")
+
+    start_time = _normalize_utc_dt(start_time)
+    end_time = _normalize_utc_dt(end_time)
 
     klines = []
     current_start = _to_ms(start_time)
@@ -184,3 +237,101 @@ def fetch_klines(
     df = df[["open", "high", "low", "close", "volume"]].dropna()
 
     return df
+
+
+def fetch_klines(
+    symbol: str,
+    interval: str,
+    start_time: Optional[datetime] = None,
+    end_time: Optional[datetime] = None,
+    limit: int = 1000,
+    timeout: int = 10,
+    max_retries: int = 5,
+    retry_delay: float = 0.4,
+    *,
+    use_local_cache: bool = True,
+) -> pd.DataFrame:
+    """
+    拉取币安K线并转为DataFrame(index=datetime)。
+    - 当提供 start_time + end_time 时，默认启用本地缓存，减少重复请求。
+    - 实时/limit 场景（无时间范围）保持直接请求。
+    """
+    symbol = symbol.upper().strip()
+    if interval not in INTERVAL_TO_MS:
+        raise BinanceDataError(f"不支持的 interval: {interval}")
+
+    start_time = _normalize_utc_dt(start_time)
+    end_time = _normalize_utc_dt(end_time)
+
+    if not use_local_cache or start_time is None or end_time is None:
+        return _fetch_klines_remote(
+            symbol=symbol,
+            interval=interval,
+            start_time=start_time,
+            end_time=end_time,
+            limit=limit,
+            timeout=timeout,
+            max_retries=max_retries,
+            retry_delay=retry_delay,
+        )
+
+    if start_time >= end_time:
+        raise BinanceDataError("start_time 必须早于 end_time")
+
+    cache_path = _cache_file_path(symbol=symbol, interval=interval)
+    cached = _load_cached_klines(cache_path)
+    interval_delta = pd.to_timedelta(int(INTERVAL_TO_MS[interval]), unit="ms")
+    req_start = pd.Timestamp(start_time)
+    req_end = pd.Timestamp(end_time)
+
+    segments: list[tuple[pd.Timestamp, pd.Timestamp]] = []
+    if cached.empty:
+        segments.append((req_start, req_end))
+    else:
+        cache_start = pd.Timestamp(cached.index.min())
+        cache_end = pd.Timestamp(cached.index.max())
+        if req_start < cache_start:
+            segments.append((req_start, cache_start))
+        if req_end > cache_end + interval_delta:
+            segments.append((cache_end + interval_delta, req_end))
+
+    fetched_parts: list[pd.DataFrame] = []
+    for seg_start, seg_end in segments:
+        if seg_start >= seg_end:
+            continue
+        part = _fetch_klines_remote(
+            symbol=symbol,
+            interval=interval,
+            start_time=seg_start.to_pydatetime(),
+            end_time=seg_end.to_pydatetime(),
+            limit=limit,
+            timeout=timeout,
+            max_retries=max_retries,
+            retry_delay=retry_delay,
+        )
+        fetched_parts.append(part)
+
+    if fetched_parts:
+        merged = pd.concat([cached] + fetched_parts) if not cached.empty else pd.concat(fetched_parts)
+        merged = merged[~merged.index.duplicated(keep="last")].sort_index()
+        _save_cached_klines(cache_path, merged)
+        cached = merged
+
+    out = cached[(cached.index >= req_start) & (cached.index < req_end)].copy()
+    if out.empty:
+        # 兜底：避免缓存异常导致空数据
+        out = _fetch_klines_remote(
+            symbol=symbol,
+            interval=interval,
+            start_time=start_time,
+            end_time=end_time,
+            limit=limit,
+            timeout=timeout,
+            max_retries=max_retries,
+            retry_delay=retry_delay,
+        )
+        merged = pd.concat([cached, out]) if not cached.empty else out
+        merged = merged[~merged.index.duplicated(keep="last")].sort_index()
+        _save_cached_klines(cache_path, merged)
+
+    return out

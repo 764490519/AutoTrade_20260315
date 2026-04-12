@@ -1,14 +1,13 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import threading
-import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-import backtrader as bt
 import pandas as pd
 
+from backtest_engine import infer_latest_signal
 from binance_data import INTERVAL_TO_MS, fetch_klines
 from okx_trading import OKXClient, OKXConfig
 
@@ -48,6 +47,7 @@ class LiveTradingConfig:
     lookback_bars: int = 500
     poll_seconds: int = 5
     only_new_bar: bool = True
+    include_unclosed_last_bar: bool = True
     close_on_flat: bool = True
     allow_short: bool = True
 
@@ -55,33 +55,13 @@ class LiveTradingConfig:
     okx_inst_type: str = "SWAP"
     okx_td_mode: str = "cross"
     okx_pos_side: str = "net"
+    okx_leverage: str | None = None
     okx_ccy: str | None = None
     order_size: str = "0.01"
 
     strategy_params: dict[str, Any] = field(default_factory=dict)
     strategy_name: str = "Strategy"
-
-
-class _SignalProbeAnalyzer(bt.Analyzer):
-    def start(self) -> None:
-        self.last_dt = None
-        self.last_close = None
-        self.last_pos = 0.0
-        self.count = 0
-
-    def next(self) -> None:
-        self.last_dt = self.strategy.datas[0].datetime.datetime(0)
-        self.last_close = float(self.strategy.datas[0].close[0])
-        self.last_pos = float(getattr(self.strategy.position, "size", 0.0))
-        self.count += 1
-
-    def get_analysis(self) -> dict[str, Any]:
-        return {
-            "dt": self.last_dt,
-            "close": self.last_close,
-            "pos": self.last_pos,
-            "bars": self.count,
-        }
+    position_percent: float = 95.0
 
 
 def _drop_unclosed_last_bar(df: pd.DataFrame, interval: str) -> pd.DataFrame:
@@ -106,6 +86,7 @@ def infer_signal_from_strategy(
     strategy_cls,
     strategy_params: dict[str, Any],
     df: pd.DataFrame,
+    position_percent: float = 95.0,
 ) -> LiveSignalSnapshot:
     if df.empty or len(df) < 30:
         raise LiveTradingError("K线数据不足，无法推断策略信号")
@@ -114,52 +95,40 @@ def infer_signal_from_strategy(
     if isinstance(data_df.index, pd.DatetimeIndex) and data_df.index.tz is not None:
         data_df.index = data_df.index.tz_convert("UTC").tz_localize(None)
 
-    cerebro = bt.Cerebro(stdstats=False)
-    cerebro.broker.set_coc(True)  # 以收盘价成交，便于实时信号映射
-    data_feed = bt.feeds.PandasData(
-        dataname=data_df,
-        datetime=None,
-        open="open",
-        high="high",
-        low="low",
-        close="close",
-        volume="volume",
-        openinterest=-1,
-    )
-    cerebro.adddata(data_feed)
-    cerebro.addstrategy(strategy_cls, **(strategy_params or {}))
-    cerebro.broker.setcash(10_000)
-    cerebro.broker.setcommission(commission=0.001)
-    cerebro.addsizer(bt.sizers.PercentSizer, percents=95)
-    cerebro.addanalyzer(_SignalProbeAnalyzer, _name="probe")
+    try:
+        info = infer_latest_signal(
+            data_df,
+            strategy_cls=strategy_cls,
+            strategy_params=strategy_params,
+            position_percent=position_percent,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise LiveTradingError(f"策略信号计算失败: {exc}") from exc
 
-    result = cerebro.run()[0]
-    probe = result.analyzers.probe.get_analysis()
-    dt = probe.get("dt")
-    close = float(probe.get("close", 0.0) or 0.0)
-    pos = float(probe.get("pos", 0.0) or 0.0)
-    bars = int(probe.get("bars", 0) or 0)
+    dt = info.get("latest_bar_time")
     if dt is None:
-        raise LiveTradingError("策略未产生有效信号（可能参数导致未运行 next）")
-
-    signal = "FLAT"
-    if pos > 0:
-        signal = "LONG"
-    elif pos < 0:
-        signal = "SHORT"
+        raise LiveTradingError("策略未产生有效信号")
 
     return LiveSignalSnapshot(
-        signal=signal,
+        signal=str(info.get("signal", "FLAT")),
         latest_bar_time=dt if isinstance(dt, datetime) else pd.to_datetime(dt).to_pydatetime(),
-        latest_close=close,
-        strategy_position=pos,
-        bars=bars,
+        latest_close=float(info.get("latest_close", 0.0) or 0.0),
+        strategy_position=float(info.get("strategy_position", 0.0) or 0.0),
+        bars=int(info.get("bars", 0) or 0),
     )
 
 
-def fetch_realtime_closed_klines(symbol: str, interval: str, lookback_bars: int = 500) -> pd.DataFrame:
+def fetch_realtime_klines(
+    symbol: str,
+    interval: str,
+    lookback_bars: int = 500,
+    *,
+    include_unclosed_last_bar: bool = False,
+) -> pd.DataFrame:
     bars = max(60, min(1000, int(lookback_bars)))
     df = fetch_klines(symbol=symbol, interval=interval, limit=bars)
+    if include_unclosed_last_bar:
+        return df
     return _drop_unclosed_last_bar(df, interval=interval)
 
 
@@ -182,15 +151,17 @@ def execute_signal_once(
     last_processed_bar: datetime | None = None,
 ) -> LiveExecutionResult:
     try:
-        df = fetch_realtime_closed_klines(
+        df = fetch_realtime_klines(
             symbol=config.market_symbol,
             interval=config.interval,
             lookback_bars=config.lookback_bars,
+            include_unclosed_last_bar=bool(config.include_unclosed_last_bar),
         )
         snapshot = infer_signal_from_strategy(
             strategy_cls=strategy_cls,
             strategy_params=config.strategy_params,
             df=df,
+            position_percent=float(config.position_percent),
         )
         if config.only_new_bar and last_processed_bar is not None and snapshot.latest_bar_time <= last_processed_bar:
             return LiveExecutionResult(
@@ -202,16 +173,35 @@ def execute_signal_once(
                 latest_close=snapshot.latest_close,
             )
         signal = snapshot.signal
+        inst_type_upper = (config.okx_inst_type or "").upper()
+        allow_short = bool(config.allow_short) and inst_type_upper != "SPOT"
+        leverage_text = str(config.okx_leverage or "").strip()
         current_pos = _get_okx_position(
             client=client,
             inst_id=config.okx_inst_id,
             inst_type=config.okx_inst_type or None,
         )
 
-        # 信号 -> 执行动作
         action = "HOLD"
         order_resp = None
         close_resp = None
+
+        def _maybe_set_swap_leverage() -> None:
+            if inst_type_upper != "SWAP" or not leverage_text:
+                return
+            try:
+                leverage_val = float(leverage_text)
+            except Exception as exc:  # noqa: BLE001
+                raise LiveTradingError(f"杠杆倍数格式错误: {leverage_text}") from exc
+            if leverage_val <= 0:
+                raise LiveTradingError(f"杠杆倍数必须大于 0: {leverage_text}")
+            client.set_leverage(
+                inst_id=config.okx_inst_id,
+                lever=str(leverage_text),
+                mgn_mode=config.okx_td_mode if config.okx_td_mode in {"cross", "isolated"} else "cross",
+                pos_side=(config.okx_pos_side or None),
+                ccy=config.okx_ccy,
+            )
 
         if signal == "LONG":
             if current_pos < 0:
@@ -222,6 +212,7 @@ def execute_signal_once(
                     ccy=config.okx_ccy,
                     auto_cxl=True,
                 )
+                _maybe_set_swap_leverage()
                 order_resp = client.place_order(
                     inst_id=config.okx_inst_id,
                     td_mode=config.okx_td_mode,
@@ -233,6 +224,7 @@ def execute_signal_once(
                 )
                 action = "CLOSE_SHORT_THEN_OPEN_LONG"
             elif current_pos == 0:
+                _maybe_set_swap_leverage()
                 order_resp = client.place_order(
                     inst_id=config.okx_inst_id,
                     td_mode=config.okx_td_mode,
@@ -247,7 +239,7 @@ def execute_signal_once(
                 action = "HOLD_LONG"
 
         elif signal == "SHORT":
-            if not config.allow_short:
+            if not allow_short:
                 action = "HOLD_NO_SHORT"
             elif current_pos > 0:
                 close_resp = client.close_position(
@@ -257,6 +249,7 @@ def execute_signal_once(
                     ccy=config.okx_ccy,
                     auto_cxl=True,
                 )
+                _maybe_set_swap_leverage()
                 order_resp = client.place_order(
                     inst_id=config.okx_inst_id,
                     td_mode=config.okx_td_mode,
@@ -268,6 +261,7 @@ def execute_signal_once(
                 )
                 action = "CLOSE_LONG_THEN_OPEN_SHORT"
             elif current_pos == 0:
+                _maybe_set_swap_leverage()
                 order_resp = client.place_order(
                     inst_id=config.okx_inst_id,
                     td_mode=config.okx_td_mode,
@@ -283,7 +277,7 @@ def execute_signal_once(
 
         else:  # FLAT
             if config.close_on_flat and abs(current_pos) > 1e-12:
-                if (config.okx_inst_type or "").upper() == "SPOT":
+                if inst_type_upper == "SPOT":
                     side = "sell" if current_pos > 0 else "buy"
                     order_resp = client.place_order(
                         inst_id=config.okx_inst_id,
