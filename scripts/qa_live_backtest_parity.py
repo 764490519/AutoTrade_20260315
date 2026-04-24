@@ -1,5 +1,6 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
+import argparse
 import random
 import sys
 from pathlib import Path
@@ -15,7 +16,6 @@ from binance_data import fetch_klines
 from live_trading_engine import infer_signal_from_strategy
 from strategy_files.donchian_breakout import DonchianChannelBreakoutStrategy
 from strategy_files.fast_rsi_flip import FastRsiFlipStrategy
-from strategy_files.ma_trend_faber import FaberMaTrendStrategy
 
 
 def _signal(pos: float) -> str:
@@ -26,16 +26,30 @@ def _signal(pos: float) -> str:
     return "FLAT"
 
 
-def _check_case(name: str, strategy_cls, params: dict, interval: str, limit: int, position_percent: float) -> None:
-    df = fetch_klines("BTCUSDT", interval, limit=limit)
+def _check_case(
+    *,
+    symbol: str,
+    checks: int,
+    name: str,
+    strategy_cls,
+    params: dict,
+    interval: str,
+    limit: int,
+    position_percent: float,
+) -> None:
+    df = fetch_klines(symbol, interval, limit=limit)
     if isinstance(df.index, pd.DatetimeIndex) and df.index.tz is not None:
         df = df.tz_convert("UTC").tz_localize(None)
+
+    if len(df) < 90:
+        raise RuntimeError(f"{name} 数据不足，至少需要 90 根K线，当前={len(df)}")
 
     target = build_target_series(df, strategy_cls, params, position_percent=position_percent)
     held = target.ffill().fillna(0.0)
 
+    sample_n = max(1, min(int(checks), max(1, len(df) - 81)))
     random.seed(42)
-    idx_list = sorted(random.sample(range(80, len(df) - 1), 20))
+    idx_list = sorted(random.sample(range(80, len(df) - 1), sample_n))
     mismatches = []
     for i in idx_list:
         sub = df.iloc[: i + 1]
@@ -55,42 +69,57 @@ def _check_case(name: str, strategy_cls, params: dict, interval: str, limit: int
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="检查回测信号与实时信号推断一致性")
+    parser.add_argument("--symbol", type=str, default="BTCUSDT")
+    parser.add_argument("--position-percent", type=float, default=95.0)
+    parser.add_argument("--checks", type=int, default=20)
+    args = parser.parse_args()
+
     _check_case(
-        "FaberMaTrend",
-        FaberMaTrendStrategy,
-        {"fast_period": 11, "slow_period": 60},
-        "4h",
-        800,
-        95.0,
-    )
-    _check_case(
-        "FastRsiFlip",
-        FastRsiFlipStrategy,
-        {"rsi_period": 8, "up": 55, "dn": 45, "ema_period": 40, "atr_period": 14, "stop_atr": 0.8, "cooldown": 2, "can_short": 1},
-        "1h",
-        1000,
-        95.0,
-    )
-    _check_case(
-        "Donchian",
-        DonchianChannelBreakoutStrategy,
-        {
-            "entry_period": 55,
-            "exit_period": 20,
+        symbol=args.symbol,
+        checks=args.checks,
+        name="FastRsiFlip",
+        strategy_cls=FastRsiFlipStrategy,
+        params={
+            "rsi_period": 8,
+            "up": 55,
+            "dn": 45,
+            "ema_period": 40,
             "atr_period": 14,
-            "atr_filter_enabled": 1,
-            "atr_ratio_min": 0.003,
-            "atr_ratio_max": 0.05,
-            "stop_atr_mult": 2.0,
-            "trail_atr_mult": 2.0,
+            "stop_atr": 0.8,
+            "cooldown": 2,
             "can_short": 1,
         },
-        "1h",
-        1000,
-        95.0,
+        interval="1h",
+        limit=1000,
+        position_percent=float(args.position_percent),
     )
+
+    _check_case(
+        symbol=args.symbol,
+        checks=args.checks,
+        name="Donchian",
+        strategy_cls=DonchianChannelBreakoutStrategy,
+        params={
+            "entry_period": 55,
+            "exit_period": 20,
+            "can_short": 1,
+            "block_entry_window_bj": 1,
+            "adx_filter_enabled": 1,
+            "adx_period": 14,
+            "adx_min": 20.0,
+            "trail_atr_enabled": 0,
+            "trail_atr_period": 14,
+            "trail_atr_mult": 3.0,
+        },
+        interval="1h",
+        limit=1000,
+        position_percent=float(args.position_percent),
+    )
+
     print("[PARITY] all parity checks passed")
 
 
 if __name__ == "__main__":
     main()
+

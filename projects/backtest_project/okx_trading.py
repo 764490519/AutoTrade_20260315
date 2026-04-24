@@ -97,6 +97,30 @@ class OKXClient:
             return data
         return [data] if data else []
 
+    def _public_get(self, path: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+        params = params or {}
+        response = requests.get(
+            url=f"{self.config.base_url}{path}",
+            params={k: v for k, v in params.items() if v is not None},
+            timeout=self.config.timeout,
+        )
+        if response.status_code != 200:
+            raise OKXAPIError(f"OKX 公共接口 HTTP 错误: {response.status_code}, body={response.text}")
+        try:
+            payload = response.json()
+        except Exception as exc:  # noqa: BLE001
+            raise OKXAPIError(f"OKX 公共接口返回非 JSON 响应: {response.text}") from exc
+
+        code = str(payload.get("code", ""))
+        if code != "0":
+            msg = payload.get("msg", "unknown error")
+            raise OKXAPIError(f"OKX 公共接口错误 code={code}, msg={msg}")
+
+        data = payload.get("data")
+        if isinstance(data, list):
+            return data
+        return [data] if data else []
+
     def get_positions(self, inst_id: str | None = None, inst_type: str | None = None) -> list[dict[str, Any]]:
         return self._request(
             "GET",
@@ -106,6 +130,22 @@ class OKXClient:
 
     def get_balances(self, ccy: str | None = None) -> list[dict[str, Any]]:
         return self._request("GET", "/api/v5/account/balance", {"ccy": ccy})
+
+    def get_ticker(self, inst_id: str) -> dict[str, Any]:
+        data = self._public_get(
+            "/api/v5/market/ticker",
+            {"instId": inst_id},
+        )
+        return data[0] if data else {}
+
+    def get_instrument(self, *, inst_id: str, inst_type: str) -> dict[str, Any]:
+        data = self._public_get(
+            "/api/v5/public/instruments",
+            {"instId": inst_id, "instType": inst_type},
+        )
+        if not data:
+            raise OKXAPIError(f"未找到 OKX 标的信息: instId={inst_id}, instType={inst_type}")
+        return data[0]
 
     def place_order(
         self,
@@ -119,6 +159,7 @@ class OKXClient:
         reduce_only: bool | None = None,
         pos_side: str | None = None,
         ccy: str | None = None,
+        tgt_ccy: str | None = None,
     ) -> dict[str, Any]:
         data = self._request(
             "POST",
@@ -133,6 +174,7 @@ class OKXClient:
                 "reduceOnly": str(reduce_only).lower() if reduce_only is not None else None,
                 "posSide": pos_side,
                 "ccy": ccy,
+                "tgtCcy": tgt_ccy,
             },
         )
         return data[0] if data else {}
@@ -155,6 +197,28 @@ class OKXClient:
                 "posSide": pos_side,
                 "ccy": ccy,
                 "autoCxl": str(auto_cxl).lower() if auto_cxl is not None else None,
+            },
+        )
+        return data[0] if data else {}
+
+    def set_leverage(
+        self,
+        *,
+        inst_id: str,
+        lever: str,
+        mgn_mode: str = "cross",
+        pos_side: str | None = None,
+        ccy: str | None = None,
+    ) -> dict[str, Any]:
+        data = self._request(
+            "POST",
+            "/api/v5/account/set-leverage",
+            {
+                "instId": inst_id,
+                "lever": str(lever),
+                "mgnMode": mgn_mode,
+                "posSide": pos_side,
+                "ccy": ccy,
             },
         )
         return data[0] if data else {}

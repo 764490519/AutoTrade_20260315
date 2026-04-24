@@ -1,5 +1,6 @@
 ﻿from __future__ import annotations
 
+import ast
 import json
 import traceback
 import hashlib
@@ -7,10 +8,11 @@ import csv
 import math
 import os
 import re
+import time as time_module
 from collections.abc import Mapping
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from uuid import uuid4
 
 import pandas as pd
@@ -21,7 +23,9 @@ from backtest_engine import run_backtest
 from binance_data import BinanceDataError, INTERVAL_TO_MS, fetch_klines
 from optimization_engine import (
     optimize_parameters,
+    optimize_parameters_multi_symbol,
     optimize_parameters_optuna,
+    optimize_parameters_optuna_multi_symbol,
     run_walk_forward,
     run_walk_forward_optuna,
 )
@@ -29,6 +33,7 @@ from api_config import API_CONFIG_FILE, get_api_config_section
 from email_notifier import EmailConfig, EmailNotifier, EmailNotifyError
 from live_trading_engine import (
     LiveTradingConfig,
+    estimate_min_order_notional_usdt,
     execute_signal_once,
     get_live_worker_state,
     start_live_worker,
@@ -63,6 +68,8 @@ else:
     REPORT_DIR = APP_ROOT_DIR / "reports"
 BACKTEST_RUN_DIR = REPORT_DIR / "backtest_runs"
 BACKTEST_LOG_CSV = REPORT_DIR / "backtest_run_history.csv"
+OPT_RUN_DIR = REPORT_DIR / "optimization_runs"
+OPT_LOG_CSV = REPORT_DIR / "optimization_run_history.csv"
 UI_STATE_FILE = REPORT_DIR / "ui_state.json"
 OP_LOG_CSV = REPORT_DIR / "operation_logs.csv"
 OP_LOG_DETAIL_DIR = REPORT_DIR / "operation_log_details"
@@ -99,6 +106,11 @@ PERSIST_STATE_KEYS = {
     "opt_parallel",
     "opt_workers",
     "opt_selected_params",
+    "opt_multi_symbol_enabled",
+    "opt_multi_symbol_list",
+    "opt_multi_symbol_custom",
+    "opt_symbol_workers",
+    "opt_custom_score_expr",
     "last_optimized_params",
     "last_optimized_strategy_file",
     "okx_inst_type",
@@ -120,8 +132,6 @@ PERSIST_STATE_KEYS = {
     "live_poll_seconds",
     "live_lookback_bars",
     "live_only_new_bar",
-    "live_close_on_flat",
-    "live_allow_short",
     "live_confirm_trade",
 }
 
@@ -137,6 +147,32 @@ COMMON_MARKET_SYMBOLS = [
     "TRXUSDT",
     "LTCUSDT",
     "AVAXUSDT",
+    "LINKUSDT",
+    "DOTUSDT",
+    "BCHUSDT",
+    "UNIUSDT",
+    "ATOMUSDT",
+    "NEARUSDT",
+    "APTUSDT",
+    "ARBUSDT",
+    "OPUSDT",
+    "FILUSDT",
+    "ETCUSDT",
+    "XLMUSDT",
+    "ALGOUSDT",
+    "AAVEUSDT",
+    "INJUSDT",
+    "SUIUSDT",
+    "SEIUSDT",
+    "TIAUSDT",
+    "MATICUSDT",
+    "TONUSDT",
+    "PEPEUSDT",
+    "WIFUSDT",
+    "SHIBUSDT",
+    "ICPUSDT",
+    "GALAUSDT",
+    "SANDUSDT",
 ]
 OKX_SYMBOL_QUOTE_SUFFIXES = (
     "USDT",
@@ -150,6 +186,24 @@ OKX_SYMBOL_QUOTE_SUFFIXES = (
     "USD",
     "EUR",
 )
+
+_CUSTOM_SCORE_ALLOWED_FUNCS: dict[str, Any] = {
+    "abs": abs,
+    "max": max,
+    "min": min,
+    "round": round,
+    "pow": pow,
+}
+_CUSTOM_SCORE_ALLOWED_VAR_NAMES = {
+    "sharpe",
+    "total_return",
+    "annual_return",
+    "max_drawdown",
+    "abs_max_drawdown",
+    "win_rate",
+    "trades",
+    "return_drawdown_ratio",
+}
 
 NEW_STRATEGY_TEMPLATE = """from __future__ import annotations
 
@@ -368,6 +422,141 @@ def _normalize_market_symbol(value: Any) -> str:
     return text
 
 
+def _to_finite_float(value: Any, default: float = 0.0) -> float:
+    try:
+        out = float(value)
+    except Exception:  # noqa: BLE001
+        return float(default)
+    if not math.isfinite(out):
+        return float(default)
+    return out
+
+
+def _format_okx_uptime_to_minute(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return "-"
+    ts = pd.to_datetime(text, utc=True, errors="coerce")
+    if pd.isna(ts):
+        try:
+            ts = pd.to_datetime(float(text), unit="ms", utc=True, errors="coerce")
+        except Exception:  # noqa: BLE001
+            ts = pd.NaT
+    if pd.isna(ts):
+        return "-"
+    return ts.tz_convert("Asia/Shanghai").strftime("%Y-%m-%d %H:%M")
+
+
+def _parse_market_symbols_text(raw_text: Any) -> list[str]:
+    text = str(raw_text or "").strip()
+    if not text:
+        return []
+    out: list[str] = []
+    for part in re.split(r"[,\s;，；]+", text):
+        symbol = _normalize_market_symbol(part)
+        if symbol and symbol not in out:
+            out.append(symbol)
+    return out
+
+
+def _resolve_multi_opt_symbols(
+    current_symbol: Any,
+    selected_symbols: list[Any] | None,
+    custom_symbols_text: Any,
+) -> list[str]:
+    out: list[str] = []
+    current = _normalize_market_symbol(current_symbol)
+    if current:
+        out.append(current)
+    for raw in selected_symbols or []:
+        symbol = _normalize_market_symbol(raw)
+        if symbol and symbol not in out:
+            out.append(symbol)
+    for symbol in _parse_market_symbols_text(custom_symbols_text):
+        if symbol and symbol not in out:
+            out.append(symbol)
+    return out
+
+
+def _build_custom_score_func(
+    expr: str,
+) -> tuple[Callable[[dict[str, Any], str, dict[str, Any]], float] | None, str | None]:
+    expr_text = str(expr or "").strip()
+    if not expr_text:
+        return None, "自定义评分表达式不能为空。"
+
+    try:
+        tree = ast.parse(expr_text, mode="eval")
+    except Exception as exc:  # noqa: BLE001
+        return None, f"表达式解析失败：{exc}"
+
+    allowed_nodes = (
+        ast.Expression,
+        ast.BinOp,
+        ast.UnaryOp,
+        ast.Add,
+        ast.Sub,
+        ast.Mult,
+        ast.Div,
+        ast.Pow,
+        ast.Mod,
+        ast.UAdd,
+        ast.USub,
+        ast.Constant,
+        ast.Name,
+        ast.Load,
+        ast.Call,
+    )
+
+    for node in ast.walk(tree):
+        if not isinstance(node, allowed_nodes):
+            return None, f"表达式包含不支持语法：{type(node).__name__}"
+        if isinstance(node, ast.Name):
+            if (
+                node.id not in _CUSTOM_SCORE_ALLOWED_VAR_NAMES
+                and node.id not in _CUSTOM_SCORE_ALLOWED_FUNCS
+            ):
+                return None, f"表达式变量不允许：{node.id}"
+        if isinstance(node, ast.Call):
+            if not isinstance(node.func, ast.Name) or node.func.id not in _CUSTOM_SCORE_ALLOWED_FUNCS:
+                return None, "仅允许调用 abs/max/min/round/pow。"
+
+    try:
+        compiled = compile(tree, "<custom_score_expr>", "eval")
+    except Exception as exc:  # noqa: BLE001
+        return None, f"表达式编译失败：{exc}"
+
+    def _score_func(metrics: dict[str, Any], _symbol: str, _params: dict[str, Any]) -> float:
+        safe_metrics = metrics if isinstance(metrics, dict) else {}
+        total_return = _to_finite_float(safe_metrics.get("总收益率(%)"), 0.0)
+        annual_return = _to_finite_float(safe_metrics.get("年化收益率(%)"), 0.0)
+        max_drawdown = _to_finite_float(safe_metrics.get("最大回撤(%)"), 0.0)
+        abs_max_drawdown = abs(max_drawdown)
+        sharpe = _to_finite_float(safe_metrics.get("Sharpe"), 0.0)
+        win_rate = _to_finite_float(safe_metrics.get("胜率(%)"), 0.0)
+        trades = _to_finite_float(safe_metrics.get("总交易次数"), 0.0)
+        return_drawdown_ratio = annual_return / abs_max_drawdown if abs_max_drawdown > 1e-12 else 0.0
+
+        local_vars = {
+            "sharpe": sharpe,
+            "total_return": total_return,
+            "annual_return": annual_return,
+            "max_drawdown": max_drawdown,
+            "abs_max_drawdown": abs_max_drawdown,
+            "win_rate": win_rate,
+            "trades": trades,
+            "return_drawdown_ratio": return_drawdown_ratio,
+            **_CUSTOM_SCORE_ALLOWED_FUNCS,
+        }
+        result = eval(compiled, {"__builtins__": {}}, local_vars)  # noqa: S307
+        score = float(result)
+        if not math.isfinite(score):
+            raise ValueError("自定义评分结果不是有限数值")
+        return score
+
+    return _score_func, None
+
+
 def _split_market_symbol_base_quote(value: Any) -> tuple[str, str] | None:
     symbol = _normalize_market_symbol(value)
     if not symbol:
@@ -457,8 +646,14 @@ def _normalize_persisted_choice(key: str, value: Any) -> Any:
             return "总收益率(%)"
         if "年化" in text:
             return "年化收益率(%)"
+        if "胜率" in text or "win" in low:
+            return "胜率(%)"
+        if "收益回撤比" in text or ("drawdown" in low and "ratio" in low):
+            return "收益回撤比"
         if "回撤" in text:
             return "最大回撤(%)"
+        if "自定义" in text or "custom" in low:
+            return "自定义评分表达式"
         return "Sharpe"
 
     if key == "opt_sampler":
@@ -766,7 +961,7 @@ def _send_trade_email_notification(
         f"side: {req.get('side', '-')}\n"
         f"tdMode: {req.get('tdMode', '-')}\n"
         f"ordType: {req.get('ordType', '-')}\n"
-        f"sz: {req.get('sz', '-')}\n"
+        f"下单金额(USDT): {req.get('order_notional_usdt', req.get('sz', '-'))}\n"
         f"px: {req.get('px', '-')}\n"
         f"posSide: {req.get('posSide', '-')}\n"
         f"ccy: {req.get('ccy', '-')}\n"
@@ -776,6 +971,8 @@ def _send_trade_email_notification(
         f"clOrdId: {cl_ord_id or '-'}\n"
         f"sCode: {s_code or '-'}\n"
         f"sMsg: {s_msg or '-'}\n"
+        f"换算后下单数量(sz): {resp.get('resolved_sz', '-') if isinstance(resp, dict) else '-'}\n"
+        f"换算参考价: {resp.get('ref_price', '-') if isinstance(resp, dict) else '-'}\n"
     )
     if error_message:
         body += f"\n错误信息:\n{error_message}\n"
@@ -889,6 +1086,31 @@ def _get_current_strategy_runtime_for_live() -> tuple[Any, str, dict[str, Any], 
     return strategy_cls, strategy_display_name, params, param_schema
 
 
+def _validate_live_order_size_or_error(
+    *,
+    client: OKXClient,
+    live_cfg: LiveTradingConfig,
+) -> tuple[bool, str | None]:
+    order_size = _to_finite_float(live_cfg.order_size, default=float("nan"))
+    if not math.isfinite(order_size) or order_size <= 0:
+        return False, "实盘下单金额(USDT)必须是大于 0 的数字。"
+
+    try:
+        min_info = estimate_min_order_notional_usdt(client, live_cfg)
+    except Exception as exc:  # noqa: BLE001
+        return False, f"下单前校验失败：{exc}"
+
+    min_notional = _to_finite_float(min_info.get("min_notional_usdt"), default=0.0)
+    if min_notional > 0 and order_size + 1e-12 < min_notional:
+        return (
+            False,
+            f"当前 {live_cfg.okx_inst_id} 预计最小下单金额约 {min_notional:.6g} USDT，"
+            f"你设置的是 {order_size:.6g} USDT，无法下单。请调大后再执行。",
+        )
+
+    return True, None
+
+
 def _render_okx_trading_panel() -> None:
     st.divider()
     st.subheader("🟢 实盘交易模块（OKX API）")
@@ -955,17 +1177,13 @@ def _render_okx_trading_panel() -> None:
     if "live_pos_side" not in st.session_state:
         st.session_state["live_pos_side"] = "net"
     if "live_order_size" not in st.session_state:
-        st.session_state["live_order_size"] = "0.01"
+        st.session_state["live_order_size"] = "10"
     if "live_poll_seconds" not in st.session_state:
         st.session_state["live_poll_seconds"] = 10
     if "live_lookback_bars" not in st.session_state:
         st.session_state["live_lookback_bars"] = 500
     if "live_only_new_bar" not in st.session_state:
         st.session_state["live_only_new_bar"] = True
-    if "live_close_on_flat" not in st.session_state:
-        st.session_state["live_close_on_flat"] = True
-    if "live_allow_short" not in st.session_state:
-        st.session_state["live_allow_short"] = True
     if "live_confirm_trade" not in st.session_state:
         st.session_state["live_confirm_trade"] = False
 
@@ -974,13 +1192,23 @@ def _render_okx_trading_panel() -> None:
 
     st.markdown("#### 策略实时执行（实时价格 + 策略信号）")
     try:
-        live_strategy_cls, live_strategy_name, live_strategy_params, _ = _get_current_strategy_runtime_for_live()
+        live_strategy_cls, live_strategy_name, live_strategy_params, live_param_schema = _get_current_strategy_runtime_for_live()
         st.caption(f"当前策略：{live_strategy_name}")
     except Exception as exc:  # noqa: BLE001
         live_strategy_cls = None
         live_strategy_name = ""
         live_strategy_params = {}
+        live_param_schema = {}
         st.warning(f"策略编译失败，无法启动实时执行：{exc}")
+
+    live_auto_lookback_bars = max(
+        60,
+        min(
+            1000,
+            int(_infer_auto_warmup_bars(strategy_params=live_strategy_params, param_schema=live_param_schema)),
+        ),
+    )
+    st.session_state["live_lookback_bars"] = int(live_auto_lookback_bars)
 
     live_col1, live_col2, live_col3 = st.columns(3)
     with live_col1:
@@ -1009,7 +1237,8 @@ def _render_okx_trading_panel() -> None:
             st.session_state["live_market_symbol"] = live_symbol_choice
 
         st.selectbox("实时K线周期", ["1m", "5m", "15m", "1h", "4h", "1d"], key="live_interval")
-        st.number_input("历史K线窗口", min_value=60, max_value=1000, step=10, key="live_lookback_bars")
+        st.text_input("历史K线窗口（自动）", value=str(int(live_auto_lookback_bars)), disabled=True)
+        st.caption("已按策略参数自动计算窗口，无需手动设置。")
     with live_col2:
         st.selectbox(
             "实盘类型(instType)",
@@ -1027,7 +1256,7 @@ def _render_okx_trading_panel() -> None:
             st.selectbox("实盘交易模式(tdMode)", ["cross", "isolated"], key="live_td_mode")
             st.text_input("合约杠杆倍数(lever)", key="live_leverage", placeholder="例如 3 / 5 / 10")
     with live_col3:
-        st.text_input("实盘下单数量(sz)", key="live_order_size")
+        st.text_input("实盘下单金额(USDT)", key="live_order_size")
         st.selectbox(
             "实盘持仓方向(posSide)",
             ["net", "long", "short", ""],
@@ -1039,11 +1268,15 @@ def _render_okx_trading_panel() -> None:
         st.number_input("轮询秒数", min_value=2, max_value=3600, step=1, key="live_poll_seconds")
 
     st.checkbox("仅在新K线出现时执行", key="live_only_new_bar")
-    st.checkbox("信号为FLAT时自动平仓", key="live_close_on_flat")
     live_is_spot = str(st.session_state.get("live_okx_inst_type", "SWAP")).upper().strip() == "SPOT"
+    live_pos_side_runtime = "" if live_is_spot else (str(st.session_state.get("live_pos_side", "net")).strip() or "net")
+    live_allow_short_runtime = (not live_is_spot) and str(live_pos_side_runtime).lower() != "long"
     if live_is_spot:
-        st.session_state["live_allow_short"] = False
-    st.checkbox("允许做空信号执行", key="live_allow_short", disabled=live_is_spot, help="现货模式下自动禁用")
+        st.caption("做空信号执行：现货模式下自动禁用")
+    elif str(live_pos_side_runtime).lower() == "long":
+        st.caption("做空信号执行：posSide=long 时自动禁用")
+    else:
+        st.caption("做空信号执行：已启用（由 posSide 自动决定）")
     st.checkbox("我确认启用策略自动交易", key="live_confirm_trade")
 
     once_btn, start_btn, stop_btn = st.columns(3)
@@ -1079,19 +1312,18 @@ def _render_okx_trading_panel() -> None:
         live_cfg = LiveTradingConfig(
             market_symbol=live_market_symbol,
             interval=str(st.session_state.get("live_interval", "1m")).strip(),
-            lookback_bars=int(st.session_state.get("live_lookback_bars", 500)),
+            lookback_bars=int(live_auto_lookback_bars),
             poll_seconds=int(st.session_state.get("live_poll_seconds", 10)),
             only_new_bar=bool(st.session_state.get("live_only_new_bar", True)),
             include_unclosed_last_bar=True,
-            close_on_flat=bool(st.session_state.get("live_close_on_flat", True)),
-            allow_short=(False if live_is_spot else bool(st.session_state.get("live_allow_short", True))),
+            allow_short=bool(live_allow_short_runtime),
             okx_inst_id=derived_live_okx_inst_id or "",
             okx_inst_type=live_inst_type,
             okx_td_mode=("cash" if live_is_spot else str(st.session_state.get("live_td_mode", "cross")).strip()),
-            okx_pos_side=("" if live_is_spot else (str(st.session_state.get("live_pos_side", "net")).strip() or "net")),
+            okx_pos_side=live_pos_side_runtime,
             okx_leverage=(None if live_is_spot else live_leverage_value),
             okx_ccy=(str(st.session_state.get("okx_ccy", "")).strip() or None),
-            order_size=str(st.session_state.get("live_order_size", "0.01")).strip(),
+            order_size=str(st.session_state.get("live_order_size", "10")).strip(),
             strategy_params=live_strategy_params,
             strategy_name=live_strategy_name,
             position_percent=float(st.session_state.get("position_percent", 95.0)),
@@ -1107,71 +1339,76 @@ def _render_okx_trading_panel() -> None:
         elif live_inst_type == "SWAP" and not live_cfg.okx_leverage:
             st.error("合约模式下杠杆倍数无效，请检查输入。")
         else:
-            live_result = execute_signal_once(
-                client=client,
-                strategy_cls=live_strategy_cls,
-                config=live_cfg,
-            )
-            req_payload = {
-                "instId": live_cfg.okx_inst_id,
-                "instType": live_cfg.okx_inst_type,
-                "tdMode": live_cfg.okx_td_mode,
-                "posSide": live_cfg.okx_pos_side,
-                "lever": live_cfg.okx_leverage,
-                "sz": live_cfg.order_size,
-                "market_symbol": live_cfg.market_symbol,
-                "interval": live_cfg.interval,
-                "strategy": live_cfg.strategy_name,
-                "strategy_params": live_cfg.strategy_params,
-                "demo_trading": bool(client.config.demo_trading),
-            }
-            resp_payload = {
-                "action": live_result.action,
-                "signal": live_result.signal,
-                "message": live_result.message,
-                "latest_bar_time": None if live_result.latest_bar_time is None else live_result.latest_bar_time.isoformat(),
-                "latest_close": live_result.latest_close,
-                "current_pos_before": live_result.current_pos_before,
-                "current_pos_after": live_result.current_pos_after,
-                "order_response": live_result.order_response,
-                "close_response": live_result.close_response,
-            }
-
-            if live_result.status == "failed":
-                _append_operation_log(
-                    module="live_strategy",
-                    action="run_once",
-                    status="failed",
-                    request_payload=req_payload,
-                    response_payload=resp_payload,
-                    error_message=live_result.error or live_result.message,
-                )
-                st.error(f"实时执行失败：{live_result.message}")
+            ok_size, err_msg = _validate_live_order_size_or_error(client=client, live_cfg=live_cfg)
+            if not ok_size:
+                st.error(err_msg or "下单金额校验失败。")
             else:
-                _append_operation_log(
-                    module="live_strategy",
-                    action="run_once",
-                    status=live_result.status,
-                    request_payload=req_payload,
-                    response_payload=resp_payload,
+                live_result = execute_signal_once(
+                    client=client,
+                    strategy_cls=live_strategy_cls,
+                    config=live_cfg,
                 )
-                st.success(f"实时执行完成：{live_result.action} | signal={live_result.signal}")
-                st.json(resp_payload)
+                req_payload = {
+                    "instId": live_cfg.okx_inst_id,
+                    "instType": live_cfg.okx_inst_type,
+                    "tdMode": live_cfg.okx_td_mode,
+                    "posSide": live_cfg.okx_pos_side,
+                    "allow_short_signal": bool(live_cfg.allow_short),
+                    "lever": live_cfg.okx_leverage,
+                    "order_notional_usdt": live_cfg.order_size,
+                    "market_symbol": live_cfg.market_symbol,
+                    "interval": live_cfg.interval,
+                    "strategy": live_cfg.strategy_name,
+                    "strategy_params": live_cfg.strategy_params,
+                    "demo_trading": bool(client.config.demo_trading),
+                }
+                resp_payload = {
+                    "action": live_result.action,
+                    "signal": live_result.signal,
+                    "message": live_result.message,
+                    "latest_bar_time": None if live_result.latest_bar_time is None else live_result.latest_bar_time.isoformat(),
+                    "latest_close": live_result.latest_close,
+                    "current_pos_before": live_result.current_pos_before,
+                    "current_pos_after": live_result.current_pos_after,
+                    "order_response": live_result.order_response,
+                    "close_response": live_result.close_response,
+                }
 
-            if st.session_state.get("notify_trade_email", True):
-                mail_status = "success" if live_result.status in {"success", "skipped"} else "failed"
-                ok, msg = _send_trade_email_notification(
-                    email_notifier,
-                    action="live_strategy_run_once",
-                    status=mail_status,
-                    request_payload=req_payload,
-                    response_payload=resp_payload,
-                    error_message=(None if live_result.status != "failed" else (live_result.error or live_result.message)),
-                )
-                if ok:
-                    st.caption("邮件通知：已发送")
+                if live_result.status == "failed":
+                    _append_operation_log(
+                        module="live_strategy",
+                        action="run_once",
+                        status="failed",
+                        request_payload=req_payload,
+                        response_payload=resp_payload,
+                        error_message=live_result.error or live_result.message,
+                    )
+                    st.error(f"实时执行失败：{live_result.message}")
                 else:
-                    st.warning(f"邮件通知失败：{msg}")
+                    _append_operation_log(
+                        module="live_strategy",
+                        action="run_once",
+                        status=live_result.status,
+                        request_payload=req_payload,
+                        response_payload=resp_payload,
+                    )
+                    st.success(f"实时执行完成：{live_result.action} | signal={live_result.signal}")
+                    st.json(resp_payload)
+
+                if st.session_state.get("notify_trade_email", True):
+                    mail_status = "success" if live_result.status in {"success", "skipped"} else "failed"
+                    ok, msg = _send_trade_email_notification(
+                        email_notifier,
+                        action="live_strategy_run_once",
+                        status=mail_status,
+                        request_payload=req_payload,
+                        response_payload=resp_payload,
+                        error_message=(None if live_result.status != "failed" else (live_result.error or live_result.message)),
+                    )
+                    if ok:
+                        st.caption("邮件通知：已发送")
+                    else:
+                        st.warning(f"邮件通知失败：{msg}")
 
     if start_live:
         if live_strategy_cls is None or live_cfg is None:
@@ -1183,27 +1420,214 @@ def _render_okx_trading_panel() -> None:
         elif live_inst_type == "SWAP" and not live_cfg.okx_leverage:
             st.error("合约模式下杠杆倍数无效，请检查输入。")
         else:
-            start_live_worker(
-                key=LIVE_WORKER_KEY,
-                okx_config=client.config,
-                strategy_cls=live_strategy_cls,
-                config=live_cfg,
-            )
-            st.success("已启动自动执行任务")
+            ok_size, err_msg = _validate_live_order_size_or_error(client=client, live_cfg=live_cfg)
+            if not ok_size:
+                st.error(err_msg or "下单金额校验失败。")
+            else:
+                start_live_worker(
+                    key=LIVE_WORKER_KEY,
+                    okx_config=client.config,
+                    strategy_cls=live_strategy_cls,
+                    config=live_cfg,
+                )
+                st.success("已启动自动执行任务")
 
     if stop_live:
         stop_live_worker(LIVE_WORKER_KEY)
         st.success("已停止自动执行任务")
 
     worker_state = get_live_worker_state(LIVE_WORKER_KEY)
+    op_records = list(worker_state.get("recent_operation_records") or [])
+    op_count = int(worker_state.get("operation_records") or 0)
     st.caption("自动执行状态")
     ws1, ws2, ws3, ws4 = st.columns(4)
     ws1.metric("运行中", "是" if worker_state.get("running") else "否")
-    ws2.metric("循环次数", worker_state.get("loops", 0))
-    ws3.metric("执行次数", worker_state.get("executions", 0))
-    ws4.metric("最新信号", worker_state.get("last_signal") or "-")
+    ws2.metric("最新信号", worker_state.get("last_signal") or "-")
+    ws3.metric("最新动作", worker_state.get("last_action") or "-")
+    ws4.metric("交易记录", op_count)
+    started_at_utc = str(worker_state.get("started_at_utc") or "").strip()
+    ended_at_utc = str(worker_state.get("ended_at_utc") or "").strip()
+    if started_at_utc:
+        st.caption(f"开始时间(UTC)：{started_at_utc}")
+    if ended_at_utc:
+        st.caption(f"结束时间(UTC)：{ended_at_utc}")
+    if worker_state.get("last_error"):
+        st.warning(f"最近一次执行错误：{worker_state.get('last_error')}")
+    if worker_state.get("last_save_error"):
+        st.warning(f"运行记录保存失败：{worker_state.get('last_save_error')}")
+    elif worker_state.get("last_saved_csv_file"):
+        st.caption(
+            "已保存本次自动执行记录："
+            f"CSV={worker_state.get('last_saved_csv_file')} | "
+            f"JSON={worker_state.get('last_saved_json_file')}"
+        )
+
+    st.markdown("#### 当前OKX持仓")
+    try:
+        pos_rows_raw = client.get_positions(inst_type=live_inst_type)
+    except Exception as exc:  # noqa: BLE001
+        st.warning(f"持仓查询失败：{exc}")
+        pos_rows_raw = []
+
+    if pos_rows_raw:
+        pos_rows: list[dict[str, Any]] = []
+        for row in pos_rows_raw:
+            inst_id = str(row.get("instId") or "")
+            pos = _to_finite_float(row.get("pos"), 0.0)
+            if abs(pos) <= 1e-12:
+                continue
+            pos_rows.append(
+                {
+                    "inst_id": inst_id,
+                    "pos": pos,
+                    "pos_side": str(row.get("posSide") or "-"),
+                    "avg_px": _to_finite_float(row.get("avgPx"), float("nan")),
+                    "mark_px": _to_finite_float(row.get("markPx"), float("nan")),
+                    "upl": _to_finite_float(row.get("upl"), float("nan")),
+                    "upl_ratio_pct": _to_finite_float(row.get("uplRatio"), float("nan")) * 100.0,
+                    "lever": str(row.get("lever") or "-"),
+                    "mgn_mode": str(row.get("mgnMode") or "-"),
+                    "updated_bj": _format_okx_uptime_to_minute(row.get("uTime")),
+                }
+            )
+
+        if pos_rows:
+            pos_df = pd.DataFrame(pos_rows)
+            if derived_live_okx_inst_id:
+                cur_df = pos_df[pos_df["inst_id"] == derived_live_okx_inst_id].copy()
+                other_df = pos_df[pos_df["inst_id"] != derived_live_okx_inst_id].copy()
+            else:
+                cur_df = pos_df.copy()
+                other_df = pd.DataFrame()
+
+            def _render_pos_df(df: pd.DataFrame) -> pd.DataFrame:
+                out = df.copy()
+                for col in ["avg_px", "mark_px", "upl", "upl_ratio_pct"]:
+                    if col in out.columns:
+                        out[col] = pd.to_numeric(out[col], errors="coerce")
+                return out.rename(
+                    columns={
+                        "inst_id": "标的",
+                        "pos": "持仓数量",
+                        "pos_side": "方向(posSide)",
+                        "avg_px": "开仓均价",
+                        "mark_px": "标记价",
+                        "upl": "未实现盈亏(USDT)",
+                        "upl_ratio_pct": "未实现收益率(%)",
+                        "lever": "杠杆",
+                        "mgn_mode": "保证金模式",
+                        "updated_bj": "更新时间(北京时间)",
+                    }
+                )
+
+            if not cur_df.empty:
+                st.caption("当前策略标的持仓")
+                st.dataframe(_render_pos_df(cur_df), use_container_width=True, hide_index=True)
+            else:
+                st.caption("当前策略标的：无持仓")
+
+            if not other_df.empty:
+                st.warning("检测到其他标的也有持仓（可能来自其他策略/终端）")
+                st.dataframe(_render_pos_df(other_df), use_container_width=True, hide_index=True)
+        else:
+            st.caption("当前无持仓。")
+    else:
+        st.caption("当前无持仓。")
+
+    run_summary = worker_state.get("run_summary") if isinstance(worker_state.get("run_summary"), dict) else {}
+    if run_summary:
+        st.markdown("#### 本次运行总览")
+        sum1, sum2, sum3, sum4 = st.columns(4)
+        sum1.metric("已平仓笔数", int(run_summary.get("closed_trades") or 0))
+        sum2.metric("胜率", "-" if run_summary.get("win_rate_pct") is None else f"{float(run_summary.get('win_rate_pct')):.2f}%")
+        sum3.metric("总收益(USDT)", f"{float(run_summary.get('total_realized_pnl_usdt') or 0.0):.6g}")
+        sum4.metric("总收益率", "-" if run_summary.get("total_return_pct") is None else f"{float(run_summary.get('total_return_pct')):.4f}%")
+        st.caption(
+            "运行时长(秒)："
+            + ("-" if run_summary.get("duration_seconds") is None else f"{float(run_summary.get('duration_seconds')):.0f}")
+        )
+
+    st.markdown("#### 交易记录详情（开平一体）")
+    if op_records:
+        op_df = pd.DataFrame(op_records)
+        if "close_time_utc" in op_df.columns:
+            op_df = op_df.sort_values(by="close_time_utc", ascending=False)
+        display_cols = [
+            "trade_side",
+            "open_time_utc",
+            "close_time_utc",
+            "hold_minutes",
+            "qty",
+            "entry_price",
+            "exit_price",
+            "pnl_usdt",
+            "pnl_pct",
+            "entry_notional_usdt",
+            "exit_notional_usdt",
+            "open_signal",
+            "close_signal",
+            "open_bar_time_utc",
+            "close_bar_time_utc",
+            "open_ord_id",
+            "close_ord_id",
+            "open_s_code",
+            "close_s_code",
+            "open_s_msg",
+            "close_s_msg",
+            "worker_key",
+            "run_id",
+            "strategy_name",
+            "market_symbol",
+            "inst_id",
+            "inst_type",
+        ]
+        display_cols = [c for c in display_cols if c in op_df.columns]
+        display_df = op_df[display_cols].rename(
+            columns={
+                "trade_side": "方向",
+                "open_time_utc": "开仓时间(UTC)",
+                "close_time_utc": "平仓时间(UTC)",
+                "hold_minutes": "持仓分钟",
+                "qty": "数量",
+                "entry_price": "开仓价",
+                "exit_price": "平仓价",
+                "pnl_usdt": "收益(USDT)",
+                "pnl_pct": "收益率(%)",
+                "entry_notional_usdt": "开仓名义金额(USDT)",
+                "exit_notional_usdt": "平仓名义金额(USDT)",
+                "open_signal": "开仓信号",
+                "close_signal": "平仓信号",
+                "open_bar_time_utc": "开仓信号K线时间",
+                "close_bar_time_utc": "平仓信号K线时间",
+                "open_ord_id": "开仓订单ID",
+                "close_ord_id": "平仓订单ID",
+                "open_s_code": "开仓状态码",
+                "close_s_code": "平仓状态码",
+                "open_s_msg": "开仓状态信息",
+                "close_s_msg": "平仓状态信息",
+                "worker_key": "任务Key",
+                "run_id": "运行ID",
+                "strategy_name": "策略",
+                "market_symbol": "行情交易对",
+                "inst_id": "OKX标的",
+                "inst_type": "标的类型",
+            }
+        )
+        st.dataframe(display_df, use_container_width=True, hide_index=True)
+        st.download_button(
+            "下载开/平仓明细 CSV",
+            data=op_df.to_csv(index=False).encode("utf-8-sig"),
+            file_name=f"live_operation_records_{LIVE_WORKER_KEY}.csv",
+            mime="text/csv",
+            key="download_live_operation_records_csv",
+        )
+    else:
+        st.caption("本次运行尚无开/平仓记录。")
+
     with st.expander("查看自动执行详情", expanded=False):
-        st.json(worker_state)
+        state_view = dict(worker_state)
+        state_view.pop("executions", None)
+        st.json(state_view)
 
     st.markdown("#### 最近操作日志")
     log_df = _load_recent_operation_logs(limit=100)
@@ -1218,6 +1642,13 @@ def _render_okx_trading_panel() -> None:
             file_name="operation_logs_recent.csv",
             mime="text/csv",
         )
+
+    # 自动执行任务运行时，持续自动刷新页面，确保状态实时可见
+    if bool(worker_state.get("running")):
+        refresh_sec = max(1, min(30, int(st.session_state.get("live_poll_seconds", 2))))
+        st.caption(f"状态自动刷新中：约每 {refresh_sec} 秒更新一次。")
+        time_module.sleep(refresh_sec)
+        st.rerun()
 
 
 def _save_backtest_record(
@@ -1312,6 +1743,118 @@ def _save_backtest_record(
         writer.writerow(flat_row)
 
     return run_id, detail_path, BACKTEST_LOG_CSV
+
+
+def _serialize_ranking_for_export(ranking_df: pd.DataFrame) -> pd.DataFrame:
+    if not isinstance(ranking_df, pd.DataFrame):
+        return pd.DataFrame()
+    out = ranking_df.copy()
+    for col in ("参数", "最优参数"):
+        if col not in out.columns:
+            continue
+        out[col] = out[col].apply(
+            lambda x: json.dumps(x, ensure_ascii=False) if isinstance(x, (dict, list, tuple)) else x
+        )
+    return out
+
+
+def _save_optimization_record(
+    *,
+    method: str,
+    objective: str,
+    symbol: str,
+    interval: str,
+    selected_start_date: date,
+    selected_end_date: date,
+    strategy_display_name: str,
+    strategy_params: dict[str, Any],
+    selected_opt_params: list[str],
+    is_multi_symbol: bool,
+    symbols: list[str],
+    best_symbol: str | None,
+    best_params: dict[str, Any],
+    best_score: float | None,
+    ranking_df: pd.DataFrame,
+    opt_config: dict[str, Any] | None = None,
+) -> tuple[str, Path, Path, Path]:
+    REPORT_DIR.mkdir(parents=True, exist_ok=True)
+    OPT_RUN_DIR.mkdir(parents=True, exist_ok=True)
+
+    now_utc = datetime.now(timezone.utc)
+    run_id = f"opt_{now_utc.strftime('%Y%m%dT%H%M%SZ')}_{uuid4().hex[:8]}"
+
+    ranking_export = _serialize_ranking_for_export(ranking_df)
+    ranking_csv_path = OPT_RUN_DIR / f"{run_id}_ranking.csv"
+    ranking_export.to_csv(ranking_csv_path, index=False, encoding="utf-8-sig")
+
+    strategy_code = str(st.session_state.get("strategy_code", ""))
+    strategy_file_name = str(st.session_state.get("strategy_file_name", "")).strip()
+    strategy_code_sha256 = hashlib.sha256(strategy_code.encode("utf-8")).hexdigest() if strategy_code else None
+
+    detail_record = {
+        "run_id": run_id,
+        "run_time_utc": now_utc,
+        "method": str(method),
+        "objective": str(objective),
+        "symbol": str(symbol),
+        "is_multi_symbol": bool(is_multi_symbol),
+        "symbols": list(symbols),
+        "interval": str(interval),
+        "selected_start_date": selected_start_date,
+        "selected_end_date": selected_end_date,
+        "strategy_display_name": str(strategy_display_name),
+        "strategy_file_name": strategy_file_name,
+        "strategy_code_sha256": strategy_code_sha256,
+        "strategy_params": dict(strategy_params or {}),
+        "selected_opt_params": list(selected_opt_params or []),
+        "best_symbol": best_symbol,
+        "best_params": dict(best_params or {}),
+        "best_score": best_score,
+        "ranking_rows": int(len(ranking_export)),
+        "ranking_columns": list(ranking_export.columns),
+        "ranking_csv_file": str(ranking_csv_path),
+        "opt_config": dict(opt_config or {}),
+    }
+    detail_record = _to_serializable(detail_record)
+
+    detail_path = OPT_RUN_DIR / f"{run_id}.json"
+    detail_path.write_text(json.dumps(detail_record, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    error_count = 0
+    if "错误" in ranking_export.columns:
+        error_count = int(pd.Series(ranking_export["错误"]).notna().sum())
+
+    flat_row = {
+        "run_id": run_id,
+        "run_time_utc": detail_record["run_time_utc"],
+        "method": detail_record["method"],
+        "objective": detail_record["objective"],
+        "symbol": detail_record["symbol"],
+        "is_multi_symbol": detail_record["is_multi_symbol"],
+        "symbols_json": json.dumps(detail_record["symbols"], ensure_ascii=False),
+        "interval": detail_record["interval"],
+        "selected_start_date": detail_record["selected_start_date"],
+        "selected_end_date": detail_record["selected_end_date"],
+        "strategy_display_name": detail_record["strategy_display_name"],
+        "strategy_file_name": detail_record["strategy_file_name"],
+        "selected_opt_params_json": json.dumps(detail_record["selected_opt_params"], ensure_ascii=False),
+        "best_symbol": detail_record["best_symbol"],
+        "best_score": detail_record["best_score"],
+        "best_params_json": json.dumps(detail_record["best_params"], ensure_ascii=False),
+        "ranking_rows": detail_record["ranking_rows"],
+        "error_count": error_count,
+        "detail_json_file": str(detail_path),
+        "ranking_csv_file": str(ranking_csv_path),
+    }
+
+    write_header = not OPT_LOG_CSV.exists()
+    with OPT_LOG_CSV.open("a", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(flat_row.keys()))
+        if write_header:
+            writer.writeheader()
+        writer.writerow(flat_row)
+
+    return run_id, detail_path, ranking_csv_path, OPT_LOG_CSV
 
 
 def _parse_optimization_grid(raw_text: str, param_schema: dict[str, dict[str, Any]]) -> dict[str, list[Any]]:
@@ -1690,6 +2233,22 @@ def _apply_pending_widget_updates() -> None:
         st.session_state[key] = value
 
 
+def _queue_apply_best_symbol_and_params(symbol: str, best_params: dict[str, Any] | None = None) -> None:
+    """将最优币种与参数一并应用到前端控件（下一次 rerun 生效）。"""
+    normalized_symbol = _normalize_market_symbol(symbol)
+    if not normalized_symbol:
+        return
+    _queue_widget_updates(
+        {
+            "symbol": normalized_symbol,
+            "symbol_custom": normalized_symbol,
+            "symbol_select": normalized_symbol if normalized_symbol in COMMON_MARKET_SYMBOLS else SYMBOL_CUSTOM_OPTION,
+        }
+    )
+    if isinstance(best_params, dict) and best_params:
+        _queue_apply_params(best_params)
+
+
 _ensure_strategy_dir()
 _restore_persisted_ui_state()
 _apply_pending_widget_updates()
@@ -1764,6 +2323,16 @@ if "opt_workers" not in st.session_state:
     st.session_state["opt_workers"] = max(1, min(4, os.cpu_count() or 1))
 if "opt_selected_params" not in st.session_state:
     st.session_state["opt_selected_params"] = []
+if "opt_multi_symbol_enabled" not in st.session_state:
+    st.session_state["opt_multi_symbol_enabled"] = False
+if "opt_multi_symbol_list" not in st.session_state:
+    st.session_state["opt_multi_symbol_list"] = []
+if "opt_multi_symbol_custom" not in st.session_state:
+    st.session_state["opt_multi_symbol_custom"] = ""
+if "opt_symbol_workers" not in st.session_state:
+    st.session_state["opt_symbol_workers"] = max(1, min(4, os.cpu_count() or 1))
+if "opt_custom_score_expr" not in st.session_state:
+    st.session_state["opt_custom_score_expr"] = "0.5*sharpe + 0.3*return_drawdown_ratio + 0.2*annual_return"
 
 with st.sidebar:
     st.header("参数设置")
@@ -2022,6 +2591,14 @@ with st.sidebar:
     opt_parallel = bool(st.session_state.get("opt_parallel", False))
     opt_workers = int(st.session_state.get("opt_workers", max(1, min(4, os.cpu_count() or 1))))
     effective_workers = int(opt_workers) if opt_parallel else 1
+    opt_multi_symbol_enabled = bool(st.session_state.get("opt_multi_symbol_enabled", False))
+    raw_multi_symbols = st.session_state.get("opt_multi_symbol_list", [])
+    if not isinstance(raw_multi_symbols, list):
+        raw_multi_symbols = []
+    opt_multi_symbol_list: list[str] = [_normalize_market_symbol(v) for v in raw_multi_symbols if _normalize_market_symbol(v)]
+    opt_multi_symbol_custom = str(st.session_state.get("opt_multi_symbol_custom", ""))
+    opt_symbol_workers = int(st.session_state.get("opt_symbol_workers", max(1, min(4, os.cpu_count() or 1))))
+    opt_custom_score_expr = str(st.session_state.get("opt_custom_score_expr", ""))
     opt_bounds_runtime: dict[str, tuple[Any, Any]] = {}
 
     if is_backtest_mode:
@@ -2097,14 +2674,77 @@ with st.sidebar:
         else:
             st.caption("当前策略未提供参数 Schema，无法选择部分参数优化")
 
-        opt_objective_options = ["Sharpe", "总收益率(%)", "年化收益率(%)", "最大回撤(%)"]
+        opt_objective_options = [
+            "Sharpe",
+            "总收益率(%)",
+            "年化收益率(%)",
+            "胜率(%)",
+            "收益回撤比",
+            "最大回撤(%)",
+            "自定义评分表达式",
+        ]
         if st.session_state.get("opt_objective") not in opt_objective_options:
             st.session_state["opt_objective"] = "Sharpe"
         opt_objective = st.selectbox("优化目标", opt_objective_options, key="opt_objective")
         if opt_objective == "最大回撤(%)":
             st.caption("说明：最大回撤为越小越好，系统会按最小回撤寻找参数。")
+        elif opt_objective == "收益回撤比":
+            st.caption("说明：收益回撤比 = 年化收益率(%) / |最大回撤(%)|，越大越好。")
+        elif opt_objective == "自定义评分表达式":
+            opt_custom_score_expr = st.text_input(
+                "自定义评分表达式",
+                key="opt_custom_score_expr",
+                help=(
+                    "可用变量：sharpe, total_return, annual_return, max_drawdown, abs_max_drawdown, "
+                    "win_rate, trades, return_drawdown_ratio；可用函数：abs/max/min/round/pow"
+                ),
+            )
+            st.caption(f"当前表达式：{opt_custom_score_expr}")
+
+        opt_multi_symbol_enabled = st.checkbox(
+            "启用多币种批量优化",
+            key="opt_multi_symbol_enabled",
+            help="开启后会对多个币种分别优化，再统一按目标评分排序。",
+        )
+        if opt_multi_symbol_enabled:
+            valid_multi_defaults = [
+                s for s in st.session_state.get("opt_multi_symbol_list", []) if s in COMMON_MARKET_SYMBOLS
+            ]
+            if not valid_multi_defaults:
+                valid_multi_defaults = [symbol] if symbol in COMMON_MARKET_SYMBOLS else []
+            st.session_state["opt_multi_symbol_list"] = valid_multi_defaults
+            st.multiselect("批量币种（常用）", options=COMMON_MARKET_SYMBOLS, key="opt_multi_symbol_list")
+            st.text_input(
+                "附加自定义币种（逗号分隔）",
+                key="opt_multi_symbol_custom",
+                placeholder="例如 BTCUSDT,ETHUSDT,SOLUSDT",
+            )
+            resolved_multi_symbols = _resolve_multi_opt_symbols(
+                symbol,
+                st.session_state.get("opt_multi_symbol_list", []),
+                st.session_state.get("opt_multi_symbol_custom", ""),
+            )
+            st.caption(f"本次批量币种：{', '.join(resolved_multi_symbols)}（共 {len(resolved_multi_symbols)} 个）")
+            max_workers_ui = max(1, (os.cpu_count() or 1) * 4)
+            opt_symbol_workers = st.number_input(
+                "币种并发数(symbol_workers)",
+                min_value=1,
+                max_value=max_workers_ui,
+                step=1,
+                key="opt_symbol_workers",
+            )
+            st.caption(f"币种层并发：{int(opt_symbol_workers)}")
+            if bool(st.session_state.get("opt_run_wf", False)):
+                st.session_state["opt_run_wf"] = False
+
         opt_folds = st.slider("Walk-Forward 窗口数", min_value=2, max_value=8, step=1, key="opt_folds")
-        opt_run_wf = st.checkbox("优化后执行 Walk-Forward", key="opt_run_wf")
+        opt_run_wf = st.checkbox(
+            "优化后执行 Walk-Forward",
+            key="opt_run_wf",
+            disabled=bool(opt_multi_symbol_enabled),
+        )
+        if opt_multi_symbol_enabled:
+            st.caption("多币种模式暂不执行 Walk-Forward。")
         if not opt_run_wf:
             st.caption("已关闭 Walk-Forward，可明显缩短优化耗时。")
         if opt_method == "网格搜索":
@@ -2358,6 +2998,72 @@ if product_mode == "backtest" and (run_btn or optimize_btn):
             selected_opt_param_set = set(selected_opt_params_runtime)
             st.caption(f"本次参与优化参数：{', '.join(selected_opt_params_runtime)}（其余参数固定为当前值）")
 
+        objective_runtime: Any = opt_objective
+        score_func_runtime: Callable[[dict[str, Any], str, dict[str, Any]], float] | None = None
+        if opt_objective == "自定义评分表达式":
+            score_expr = str(st.session_state.get("opt_custom_score_expr", "")).strip()
+            score_func_runtime, score_err = _build_custom_score_func(score_expr)
+            if score_err or score_func_runtime is None:
+                st.error(f"自定义评分表达式无效：{score_err}")
+                st.stop()
+            st.caption(f"本次自定义评分表达式：{score_expr}")
+            objective_runtime = "自定义评分表达式"
+
+        multi_symbols_runtime = _resolve_multi_opt_symbols(
+            symbol,
+            st.session_state.get("opt_multi_symbol_list", []),
+            st.session_state.get("opt_multi_symbol_custom", ""),
+        )
+        multi_symbol_toggle = bool(st.session_state.get("opt_multi_symbol_enabled", False))
+        multi_symbol_mode_runtime = bool(multi_symbol_toggle and len(multi_symbols_runtime) >= 2)
+        if multi_symbol_toggle and not multi_symbol_mode_runtime:
+            st.info("多币种模式已开启，但可用币种不足 2 个，本次将按单币种优化执行。")
+        symbol_workers_runtime = int(st.session_state.get("opt_symbol_workers", 1))
+        symbol_workers_runtime = max(1, min(symbol_workers_runtime, max(1, (os.cpu_count() or 1) * 4)))
+        inner_workers_runtime = int(effective_workers)
+
+        symbol_data_map_for_opt: dict[str, pd.DataFrame] = {symbol: df}
+        skipped_symbols: dict[str, str] = {}
+        if multi_symbol_mode_runtime:
+            st.caption(f"本次多币种批量优化：{', '.join(multi_symbols_runtime)}")
+            extra_symbols = [s for s in multi_symbols_runtime if s != symbol]
+            if extra_symbols:
+                fetch_progress = st.progress(0.0)
+                fetch_status = st.empty()
+                total_extra = len(extra_symbols)
+                for idx, sym in enumerate(extra_symbols, start=1):
+                    fetch_status.caption(f"正在拉取多币种数据：{idx}/{total_extra} - {sym}")
+                    try:
+                        df_full_sym = load_binance_data(sym, interval, warmup_start_dt, end_dt)
+                        df_sym = df_full_sym
+                        if isinstance(df_full_sym.index, pd.DatetimeIndex):
+                            df_sym = df_full_sym[df_full_sym.index >= pd.Timestamp(start_dt)]
+                        if df_sym.empty:
+                            raise ValueError("选定区间内没有可用数据")
+                        symbol_data_map_for_opt[sym] = df_sym
+                    except Exception as exc:  # noqa: BLE001
+                        skipped_symbols[sym] = str(exc)
+                    fetch_progress.progress(float(idx) / float(max(1, total_extra)))
+                fetch_progress.empty()
+                fetch_status.empty()
+            if skipped_symbols:
+                st.warning(f"以下币种数据拉取失败，已跳过：{json.dumps(skipped_symbols, ensure_ascii=False)}")
+            if len(symbol_data_map_for_opt) < 2:
+                st.warning("可用于批量优化的币种不足 2 个，自动切换为单币种优化。")
+                multi_symbol_mode_runtime = False
+            else:
+                symbol_workers_runtime = max(1, min(int(symbol_workers_runtime), len(symbol_data_map_for_opt)))
+                cpu_total = max(1, os.cpu_count() or 1)
+                target_parallel_budget = max(1, int(cpu_total))
+                requested_total_parallel = int(symbol_workers_runtime) * int(inner_workers_runtime)
+                if requested_total_parallel > target_parallel_budget:
+                    adjusted_inner = max(1, target_parallel_budget // int(symbol_workers_runtime))
+                    if adjusted_inner < int(inner_workers_runtime):
+                        st.caption(
+                            f"多币种并行负载较高，已将每币种并发从 {int(inner_workers_runtime)} 自动下调为 {int(adjusted_inner)}"
+                        )
+                        inner_workers_runtime = int(adjusted_inner)
+
         if opt_method == "网格搜索":
             if not param_schema:
                 st.error("当前策略没有参数 Schema，无法进行网格搜索")
@@ -2398,9 +3104,11 @@ if product_mode == "backtest" and (run_btn or optimize_btn):
                 estimated_runs = int(effective_total) * (1 + int(opt_folds)) + int(opt_folds)
             else:
                 estimated_runs = int(effective_total)
-            estimated_bar_evals = estimated_runs * max(1, len(df))
+            symbol_factor = len(symbol_data_map_for_opt) if multi_symbol_mode_runtime else 1
+            estimated_runs_total = int(estimated_runs) * int(max(1, symbol_factor))
+            estimated_bar_evals = estimated_runs_total * max(1, len(df))
             st.caption(
-                f"预计总回测次数（{'含' if bool(opt_run_wf) else '不含'} Walk-Forward）：约 {estimated_runs} 次，"
+                f"预计总回测次数（{'含' if bool(opt_run_wf) else '不含'} Walk-Forward）：约 {estimated_runs_total} 次，"
                 f"数据规模：{len(df)} 根K线/次"
             )
             if estimated_bar_evals >= 20_000_000:
@@ -2411,9 +3119,10 @@ if product_mode == "backtest" and (run_btn or optimize_btn):
             if str(interval) == "1m" and len(df) >= 60_000:
                 st.warning("1m 长周期数据回测本身计算量很大，优化会明显变慢。")
 
+            grid_progress_total = int(effective_total) * int(max(1, symbol_factor if multi_symbol_mode_runtime else 1))
             grid_progress = st.progress(0.0)
             grid_status = st.empty()
-            grid_status.caption(f"网格进度：0/{effective_total}")
+            grid_status.caption(f"网格进度：0/{grid_progress_total}")
             grid_started_at = datetime.now(timezone.utc)
 
             def _on_grid_progress(done: int, total: int) -> None:
@@ -2430,63 +3139,168 @@ if product_mode == "backtest" and (run_btn or optimize_btn):
                     f"｜预计剩余：{_format_duration(eta_sec)}"
                 )
 
-            with st.spinner("正在执行网格搜索..."):
-                try:
-                    gs = optimize_parameters(
-                        df=df,
-                        strategy_cls=strategy_cls,
-                        param_grid=param_grid,
-                        initial_cash=float(initial_cash),
-                        commission=float(commission),
-                        position_percent=float(position_percent),
-                        leverage=float(leverage),
-                        position_sizing_mode=str(position_sizing_mode),
-                        fixed_trade_amount=float(effective_fixed_trade_amount),
-                        objective=opt_objective,
-                        max_combinations=int(opt_max_combinations),
-                        n_jobs=int(effective_workers),
-                        strategy_code=str(st.session_state.get("strategy_code", "")),
-                        strategy_class_name=getattr(strategy_cls, "__name__", None),
-                        progress_callback=_on_grid_progress,
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    st.error(f"网格搜索失败：{exc}")
-                    st.stop()
-            grid_progress.progress(1.0)
-            total_elapsed = (datetime.now(timezone.utc) - grid_started_at).total_seconds()
-            grid_status.caption(
-                f"网格进度：{effective_total}/{effective_total}"
-                f"｜总耗时：{_format_duration(total_elapsed)}"
-            )
-
-            if gs.ranking.empty or not gs.best_params:
-                st.warning("未找到有效参数组合")
-                st.stop()
-
-            st.success("网格搜索完成")
-            st.write("最优参数：")
-            st.json(gs.best_params)
-            st.session_state["last_optimized_params"] = dict(gs.best_params)
-            st.session_state["last_optimized_strategy_file"] = str(st.session_state.get("strategy_file_name", ""))
-            st.session_state["_last_opt_ranking"] = gs.ranking
-            st.session_state["_last_opt_method"] = "网格搜索"
-            st.session_state["_last_opt_selected_params"] = list(selected_opt_params_runtime)
-            st.session_state["_last_opt_strategy_file"] = str(st.session_state.get("strategy_file_name", ""))
-
-            topn = min(30, len(gs.ranking))
-            ranking_show = gs.ranking.head(topn).copy()
-            ranking_show["参数"] = ranking_show["参数"].apply(lambda x: json.dumps(x, ensure_ascii=False))
-            st.dataframe(ranking_show, use_container_width=True, hide_index=True)
-            _render_optimization_heatmap(
-                gs.ranking,
-                key_prefix="grid",
-                selected_params=selected_opt_params_runtime,
-            )
-
-            if bool(opt_run_wf):
-                with st.spinner("正在执行 Walk-Forward..."):
+            if multi_symbol_mode_runtime:
+                with st.spinner("正在执行多币种网格搜索..."):
                     try:
-                        wf_df, wf_summary = run_walk_forward(
+                        ms_res = optimize_parameters_multi_symbol(
+                            symbol_data_map=symbol_data_map_for_opt,
+                            strategy_cls=strategy_cls,
+                            param_grid=param_grid,
+                            initial_cash=float(initial_cash),
+                            commission=float(commission),
+                            position_percent=float(position_percent),
+                            leverage=float(leverage),
+                            position_sizing_mode=str(position_sizing_mode),
+                            fixed_trade_amount=float(effective_fixed_trade_amount),
+                            objective=objective_runtime,
+                            score_func=score_func_runtime,
+                            max_combinations=int(opt_max_combinations),
+                            n_jobs=int(inner_workers_runtime),
+                            symbol_n_jobs=int(symbol_workers_runtime),
+                            progress_callback=_on_grid_progress,
+                            strategy_code=str(st.session_state.get("strategy_code", "")),
+                            strategy_class_name=getattr(strategy_cls, "__name__", None),
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        st.error(f"多币种网格搜索失败：{exc}")
+                        st.stop()
+                grid_progress.progress(1.0)
+                total_elapsed = (datetime.now(timezone.utc) - grid_started_at).total_seconds()
+                grid_status.caption(
+                    f"网格进度：{grid_progress_total}/{grid_progress_total}"
+                    f"｜总耗时：{_format_duration(total_elapsed)}"
+                )
+
+                if ms_res.ranking.empty:
+                    st.warning("多币种网格搜索未返回有效结果")
+                    st.stop()
+
+                st.success("多币种网格搜索完成")
+                if ms_res.best_symbol:
+                    st.caption(f"最佳币种：{ms_res.best_symbol}（目标：{ms_res.objective}）")
+                else:
+                    st.caption(f"本次目标：{ms_res.objective}")
+
+                st.session_state["_last_opt_ranking"] = ms_res.ranking
+                st.session_state["_last_opt_method"] = "网格搜索(多币种)"
+                st.session_state["_last_opt_selected_params"] = list(selected_opt_params_runtime)
+                st.session_state["_last_opt_strategy_file"] = str(st.session_state.get("strategy_file_name", ""))
+                st.session_state["last_optimized_strategy_file"] = str(st.session_state.get("strategy_file_name", ""))
+                best_params_candidate: dict[str, Any] = {}
+                if ms_res.best_symbol:
+                    best_detail = ms_res.per_symbol.get(ms_res.best_symbol, {})
+                    best_params_candidate = best_detail.get("best_params") if isinstance(best_detail, dict) else {}
+                    if isinstance(best_params_candidate, dict) and best_params_candidate:
+                        st.session_state["last_optimized_params"] = dict(best_params_candidate)
+                        st.write(f"最佳币种 {ms_res.best_symbol} 对应最优参数：")
+                        st.json(best_params_candidate)
+                    if st.button("一键应用最佳币种与参数", key="apply_best_multi_grid"):
+                        _queue_apply_best_symbol_and_params(ms_res.best_symbol, best_params_candidate)
+                        st.rerun()
+
+                best_score_candidate: float | None = None
+                if "评分" in ms_res.ranking.columns and not ms_res.ranking.empty:
+                    score_ser = pd.to_numeric(pd.Series([ms_res.ranking.iloc[0]["评分"]]), errors="coerce")
+                    if not score_ser.empty and pd.notna(score_ser.iloc[0]):
+                        best_score_candidate = float(score_ser.iloc[0])
+                try:
+                    opt_run_id, opt_detail_path, _opt_ranking_path, _opt_log_path = _save_optimization_record(
+                        method="网格搜索(多币种)",
+                        objective=str(ms_res.objective),
+                        symbol=symbol,
+                        interval=interval,
+                        selected_start_date=start_date,
+                        selected_end_date=end_date,
+                        strategy_display_name=strategy_display_name,
+                        strategy_params=strategy_params,
+                        selected_opt_params=selected_opt_params_runtime,
+                        is_multi_symbol=True,
+                        symbols=list(symbol_data_map_for_opt.keys()),
+                        best_symbol=ms_res.best_symbol,
+                        best_params=best_params_candidate,
+                        best_score=best_score_candidate,
+                        ranking_df=ms_res.ranking,
+                        opt_config={
+                            "opt_method": "网格搜索",
+                            "opt_grid_mode": opt_grid_mode,
+                            "opt_points": int(opt_points),
+                            "opt_max_combinations": int(opt_max_combinations),
+                            "symbol_workers": int(symbol_workers_runtime),
+                            "workers_per_symbol": int(inner_workers_runtime),
+                            "custom_score_expr": str(st.session_state.get("opt_custom_score_expr", "")),
+                        },
+                    )
+                    st.caption(f"已自动保存优化结果：{opt_run_id}（{opt_detail_path.name}）")
+                except Exception as exc:  # noqa: BLE001
+                    st.warning(f"自动保存优化结果失败：{exc}")
+
+                ranking_show = ms_res.ranking.copy()
+                if "最优参数" in ranking_show.columns:
+                    ranking_show["最优参数"] = ranking_show["最优参数"].apply(
+                        lambda x: json.dumps(x, ensure_ascii=False) if isinstance(x, dict) else x
+                    )
+                st.dataframe(ranking_show, use_container_width=True, hide_index=True)
+
+                ranking_csv = ranking_show.to_csv(index=False).encode("utf-8-sig")
+                st.download_button(
+                    "下载多币种优化结果 CSV",
+                    data=ranking_csv,
+                    file_name=f"{strategy_display_name}_multi_symbol_grid_ranking.csv",
+                    mime="text/csv",
+                )
+
+                with st.expander("结构化结果（JSON）", expanded=False):
+                    payload = {
+                        "objective": ms_res.objective,
+                        "best_symbol": ms_res.best_symbol,
+                        "results": [_to_serializable(row) for row in ms_res.ranking.to_dict(orient="records")],
+                    }
+                    st.json(payload)
+
+                per_symbol_details = ms_res.per_symbol if isinstance(ms_res.per_symbol, dict) else {}
+                detail_symbols: list[str] = []
+                if "币种" in ms_res.ranking.columns:
+                    detail_symbols = [str(v) for v in ms_res.ranking["币种"].tolist() if str(v) in per_symbol_details]
+                if not detail_symbols:
+                    detail_symbols = list(per_symbol_details.keys())
+
+                if detail_symbols:
+                    with st.expander("查看各币种优化明细", expanded=False):
+                        for sym in detail_symbols:
+                            detail = per_symbol_details.get(sym, {})
+                            if not isinstance(detail, dict):
+                                continue
+                            st.markdown(f"**{sym}**")
+                            if detail.get("error"):
+                                st.warning(f"{sym}：{detail.get('error')}")
+                                continue
+                            sym_best_params = detail.get("best_params")
+                            if isinstance(sym_best_params, dict) and sym_best_params:
+                                st.caption("最优参数")
+                                st.json(sym_best_params)
+                            sym_metrics = detail.get("metrics")
+                            if isinstance(sym_metrics, dict) and sym_metrics:
+                                st.caption("最优参数回测指标")
+                                st.json(sym_metrics)
+                            sym_ranking = detail.get("ranking")
+                            if isinstance(sym_ranking, pd.DataFrame) and not sym_ranking.empty:
+                                sym_show = sym_ranking.head(min(20, len(sym_ranking))).copy()
+                                if "参数" in sym_show.columns:
+                                    sym_show["参数"] = sym_show["参数"].apply(
+                                        lambda x: json.dumps(x, ensure_ascii=False) if isinstance(x, dict) else x
+                                    )
+                                st.dataframe(sym_show, use_container_width=True, hide_index=True)
+                                _render_optimization_heatmap(
+                                    sym_ranking,
+                                    key_prefix=f"grid_multi_{sym}",
+                                    selected_params=selected_opt_params_runtime,
+                                )
+                if bool(opt_run_wf):
+                    st.info("多币种模式暂不支持 Walk-Forward，本次已自动跳过。")
+            else:
+                with st.spinner("正在执行网格搜索..."):
+                    try:
+                        gs = optimize_parameters(
                             df=df,
                             strategy_cls=strategy_cls,
                             param_grid=param_grid,
@@ -2496,18 +3310,109 @@ if product_mode == "backtest" and (run_btn or optimize_btn):
                             leverage=float(leverage),
                             position_sizing_mode=str(position_sizing_mode),
                             fixed_trade_amount=float(effective_fixed_trade_amount),
-                            objective=opt_objective,
-                            folds=int(opt_folds),
+                            objective=objective_runtime,
+                            score_func=score_func_runtime,
                             max_combinations=int(opt_max_combinations),
                             n_jobs=int(effective_workers),
                             strategy_code=str(st.session_state.get("strategy_code", "")),
                             strategy_class_name=getattr(strategy_cls, "__name__", None),
+                            progress_callback=_on_grid_progress,
                         )
                     except Exception as exc:  # noqa: BLE001
-                        st.error(f"Walk-Forward 失败：{exc}")
+                        st.error(f"网格搜索失败：{exc}")
                         st.stop()
-            else:
-                st.info("已按设置跳过 Walk-Forward，仅执行参数优化。")
+                grid_progress.progress(1.0)
+                total_elapsed = (datetime.now(timezone.utc) - grid_started_at).total_seconds()
+                grid_status.caption(
+                    f"网格进度：{effective_total}/{effective_total}"
+                    f"｜总耗时：{_format_duration(total_elapsed)}"
+                )
+
+                if gs.ranking.empty or not gs.best_params:
+                    st.warning("未找到有效参数组合")
+                    st.stop()
+
+                st.success("网格搜索完成")
+                st.write("最优参数：")
+                st.json(gs.best_params)
+                st.session_state["last_optimized_params"] = dict(gs.best_params)
+                st.session_state["last_optimized_strategy_file"] = str(st.session_state.get("strategy_file_name", ""))
+                st.session_state["_last_opt_ranking"] = gs.ranking
+                st.session_state["_last_opt_method"] = "网格搜索"
+                st.session_state["_last_opt_selected_params"] = list(selected_opt_params_runtime)
+                st.session_state["_last_opt_strategy_file"] = str(st.session_state.get("strategy_file_name", ""))
+
+                best_score_candidate: float | None = None
+                if "评分" in gs.ranking.columns and not gs.ranking.empty:
+                    score_ser = pd.to_numeric(pd.Series([gs.ranking.iloc[0]["评分"]]), errors="coerce")
+                    if not score_ser.empty and pd.notna(score_ser.iloc[0]):
+                        best_score_candidate = float(score_ser.iloc[0])
+                try:
+                    opt_run_id, opt_detail_path, _opt_ranking_path, _opt_log_path = _save_optimization_record(
+                        method="网格搜索",
+                        objective=str(opt_objective),
+                        symbol=symbol,
+                        interval=interval,
+                        selected_start_date=start_date,
+                        selected_end_date=end_date,
+                        strategy_display_name=strategy_display_name,
+                        strategy_params=strategy_params,
+                        selected_opt_params=selected_opt_params_runtime,
+                        is_multi_symbol=False,
+                        symbols=[symbol],
+                        best_symbol=symbol,
+                        best_params=gs.best_params,
+                        best_score=best_score_candidate,
+                        ranking_df=gs.ranking,
+                        opt_config={
+                            "opt_method": "网格搜索",
+                            "opt_grid_mode": opt_grid_mode,
+                            "opt_points": int(opt_points),
+                            "opt_max_combinations": int(opt_max_combinations),
+                            "workers": int(effective_workers),
+                            "custom_score_expr": str(st.session_state.get("opt_custom_score_expr", "")),
+                        },
+                    )
+                    st.caption(f"已自动保存优化结果：{opt_run_id}（{opt_detail_path.name}）")
+                except Exception as exc:  # noqa: BLE001
+                    st.warning(f"自动保存优化结果失败：{exc}")
+
+                topn = min(30, len(gs.ranking))
+                ranking_show = gs.ranking.head(topn).copy()
+                ranking_show["参数"] = ranking_show["参数"].apply(lambda x: json.dumps(x, ensure_ascii=False))
+                st.dataframe(ranking_show, use_container_width=True, hide_index=True)
+                _render_optimization_heatmap(
+                    gs.ranking,
+                    key_prefix="grid",
+                    selected_params=selected_opt_params_runtime,
+                )
+
+                if bool(opt_run_wf):
+                    with st.spinner("正在执行 Walk-Forward..."):
+                        try:
+                            wf_df, wf_summary = run_walk_forward(
+                                df=df,
+                                strategy_cls=strategy_cls,
+                                param_grid=param_grid,
+                                initial_cash=float(initial_cash),
+                                commission=float(commission),
+                                position_percent=float(position_percent),
+                                leverage=float(leverage),
+                                position_sizing_mode=str(position_sizing_mode),
+                                fixed_trade_amount=float(effective_fixed_trade_amount),
+                                objective=objective_runtime,
+                                score_func=score_func_runtime,
+                                folds=int(opt_folds),
+                                max_combinations=int(opt_max_combinations),
+                                n_jobs=int(effective_workers),
+                                strategy_code=str(st.session_state.get("strategy_code", "")),
+                                strategy_class_name=getattr(strategy_cls, "__name__", None),
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            st.error(f"Walk-Forward 失败：{exc}")
+                            st.stop()
+                else:
+                    st.info("已按设置跳过 Walk-Forward，仅执行参数优化。")
         else:
             if not param_schema:
                 st.error("当前策略没有参数 Schema，无法进行 Optuna 优化")
@@ -2522,58 +3427,159 @@ if product_mode == "backtest" and (run_btn or optimize_btn):
                     cfg_copy["max"] = fixed_value
                 optuna_param_schema[name] = cfg_copy
 
-            with st.spinner("正在执行 Optuna 贝叶斯优化..."):
-                try:
-                    opt_res = optimize_parameters_optuna(
-                        df=df,
-                        strategy_cls=strategy_cls,
-                        param_schema=optuna_param_schema,
-                        initial_cash=float(initial_cash),
-                        commission=float(commission),
-                        position_percent=float(position_percent),
-                        leverage=float(leverage),
-                        position_sizing_mode=str(position_sizing_mode),
-                        fixed_trade_amount=float(effective_fixed_trade_amount),
-                        objective=opt_objective,
-                        n_trials=int(opt_trials),
-                        sampler_name=str(opt_sampler),
-                        seed=int(opt_seed),
-                        n_jobs=int(effective_workers),
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    st.error(f"Optuna 优化失败：{exc}")
+            if multi_symbol_mode_runtime:
+                with st.spinner("正在执行多币种 Optuna 优化..."):
+                    try:
+                        ms_opt_res = optimize_parameters_optuna_multi_symbol(
+                            symbol_data_map=symbol_data_map_for_opt,
+                            strategy_cls=strategy_cls,
+                            param_schema=optuna_param_schema,
+                            initial_cash=float(initial_cash),
+                            commission=float(commission),
+                            position_percent=float(position_percent),
+                            leverage=float(leverage),
+                            position_sizing_mode=str(position_sizing_mode),
+                            fixed_trade_amount=float(effective_fixed_trade_amount),
+                            objective=objective_runtime,
+                            score_func=score_func_runtime,
+                            n_trials=int(opt_trials),
+                            sampler_name=str(opt_sampler),
+                            seed=int(opt_seed),
+                            n_jobs=int(inner_workers_runtime),
+                            symbol_n_jobs=int(symbol_workers_runtime),
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        st.error(f"多币种 Optuna 优化失败：{exc}")
+                        st.stop()
+
+                if ms_opt_res.ranking.empty:
+                    st.warning("多币种 Optuna 未返回有效结果")
                     st.stop()
 
-            if opt_res.ranking.empty or not opt_res.best_params:
-                st.warning("Optuna 未找到有效参数")
-                st.stop()
+                st.success("多币种 Optuna 优化完成")
+                if ms_opt_res.best_symbol:
+                    st.caption(f"最佳币种：{ms_opt_res.best_symbol}（目标：{ms_opt_res.objective}）")
+                else:
+                    st.caption(f"本次目标：{ms_opt_res.objective}")
 
-            st.success("Optuna 优化完成")
-            st.write("最优参数：")
-            st.json(opt_res.best_params)
-            st.session_state["last_optimized_params"] = dict(opt_res.best_params)
-            st.session_state["last_optimized_strategy_file"] = str(st.session_state.get("strategy_file_name", ""))
-            st.session_state["_last_opt_ranking"] = opt_res.ranking
-            st.session_state["_last_opt_method"] = "Optuna(贝叶斯)"
-            st.session_state["_last_opt_selected_params"] = list(selected_opt_params_runtime)
-            st.session_state["_last_opt_strategy_file"] = str(st.session_state.get("strategy_file_name", ""))
+                st.session_state["_last_opt_ranking"] = ms_opt_res.ranking
+                st.session_state["_last_opt_method"] = "Optuna(贝叶斯, 多币种)"
+                st.session_state["_last_opt_selected_params"] = list(selected_opt_params_runtime)
+                st.session_state["_last_opt_strategy_file"] = str(st.session_state.get("strategy_file_name", ""))
+                st.session_state["last_optimized_strategy_file"] = str(st.session_state.get("strategy_file_name", ""))
+                best_params_candidate: dict[str, Any] = {}
+                if ms_opt_res.best_symbol:
+                    best_detail = ms_opt_res.per_symbol.get(ms_opt_res.best_symbol, {})
+                    best_params_candidate = best_detail.get("best_params") if isinstance(best_detail, dict) else {}
+                    if isinstance(best_params_candidate, dict) and best_params_candidate:
+                        st.session_state["last_optimized_params"] = dict(best_params_candidate)
+                        st.write(f"最佳币种 {ms_opt_res.best_symbol} 对应最优参数：")
+                        st.json(best_params_candidate)
+                    if st.button("一键应用最佳币种与参数", key="apply_best_multi_optuna"):
+                        _queue_apply_best_symbol_and_params(ms_opt_res.best_symbol, best_params_candidate)
+                        st.rerun()
 
-            st.caption(f"最优评分：{opt_res.best_score}")
+                best_score_candidate: float | None = None
+                if "评分" in ms_opt_res.ranking.columns and not ms_opt_res.ranking.empty:
+                    score_ser = pd.to_numeric(pd.Series([ms_opt_res.ranking.iloc[0]["评分"]]), errors="coerce")
+                    if not score_ser.empty and pd.notna(score_ser.iloc[0]):
+                        best_score_candidate = float(score_ser.iloc[0])
+                try:
+                    opt_run_id, opt_detail_path, _opt_ranking_path, _opt_log_path = _save_optimization_record(
+                        method="Optuna(贝叶斯, 多币种)",
+                        objective=str(ms_opt_res.objective),
+                        symbol=symbol,
+                        interval=interval,
+                        selected_start_date=start_date,
+                        selected_end_date=end_date,
+                        strategy_display_name=strategy_display_name,
+                        strategy_params=strategy_params,
+                        selected_opt_params=selected_opt_params_runtime,
+                        is_multi_symbol=True,
+                        symbols=list(symbol_data_map_for_opt.keys()),
+                        best_symbol=ms_opt_res.best_symbol,
+                        best_params=best_params_candidate,
+                        best_score=best_score_candidate,
+                        ranking_df=ms_opt_res.ranking,
+                        opt_config={
+                            "opt_method": "Optuna(贝叶斯)",
+                            "opt_trials": int(opt_trials),
+                            "opt_sampler": str(opt_sampler),
+                            "opt_seed": int(opt_seed),
+                            "symbol_workers": int(symbol_workers_runtime),
+                            "workers_per_symbol": int(inner_workers_runtime),
+                            "custom_score_expr": str(st.session_state.get("opt_custom_score_expr", "")),
+                        },
+                    )
+                    st.caption(f"已自动保存优化结果：{opt_run_id}（{opt_detail_path.name}）")
+                except Exception as exc:  # noqa: BLE001
+                    st.warning(f"自动保存优化结果失败：{exc}")
 
-            topn = min(30, len(opt_res.ranking))
-            ranking_show = opt_res.ranking.head(topn).copy()
-            ranking_show["参数"] = ranking_show["参数"].apply(lambda x: json.dumps(x, ensure_ascii=False))
-            st.dataframe(ranking_show, use_container_width=True, hide_index=True)
-            _render_optimization_heatmap(
-                opt_res.ranking,
-                key_prefix="optuna",
-                selected_params=selected_opt_params_runtime,
-            )
+                ranking_show = ms_opt_res.ranking.copy()
+                if "最优参数" in ranking_show.columns:
+                    ranking_show["最优参数"] = ranking_show["最优参数"].apply(
+                        lambda x: json.dumps(x, ensure_ascii=False) if isinstance(x, dict) else x
+                    )
+                st.dataframe(ranking_show, use_container_width=True, hide_index=True)
+                ranking_csv = ranking_show.to_csv(index=False).encode("utf-8-sig")
+                st.download_button(
+                    "下载多币种优化结果 CSV",
+                    data=ranking_csv,
+                    file_name=f"{strategy_display_name}_multi_symbol_optuna_ranking.csv",
+                    mime="text/csv",
+                )
 
-            if bool(opt_run_wf):
-                with st.spinner("正在执行 Walk-Forward（Optuna）..."):
+                with st.expander("结构化结果（JSON）", expanded=False):
+                    payload = {
+                        "objective": ms_opt_res.objective,
+                        "best_symbol": ms_opt_res.best_symbol,
+                        "results": [_to_serializable(row) for row in ms_opt_res.ranking.to_dict(orient="records")],
+                    }
+                    st.json(payload)
+
+                per_symbol_details = ms_opt_res.per_symbol if isinstance(ms_opt_res.per_symbol, dict) else {}
+                detail_symbols: list[str] = []
+                if "币种" in ms_opt_res.ranking.columns:
+                    detail_symbols = [str(v) for v in ms_opt_res.ranking["币种"].tolist() if str(v) in per_symbol_details]
+                if not detail_symbols:
+                    detail_symbols = list(per_symbol_details.keys())
+                if detail_symbols:
+                    with st.expander("查看各币种优化明细", expanded=False):
+                        for sym in detail_symbols:
+                            detail = per_symbol_details.get(sym, {})
+                            if not isinstance(detail, dict):
+                                continue
+                            st.markdown(f"**{sym}**")
+                            if detail.get("error"):
+                                st.warning(f"{sym}：{detail.get('error')}")
+                                continue
+                            sym_best_params = detail.get("best_params")
+                            if isinstance(sym_best_params, dict) and sym_best_params:
+                                st.caption("最优参数")
+                                st.json(sym_best_params)
+                            sym_metrics = detail.get("metrics")
+                            if isinstance(sym_metrics, dict) and sym_metrics:
+                                st.caption("最优参数回测指标")
+                                st.json(sym_metrics)
+                            sym_ranking = detail.get("ranking")
+                            if isinstance(sym_ranking, pd.DataFrame) and not sym_ranking.empty:
+                                sym_show = sym_ranking.head(min(20, len(sym_ranking))).copy()
+                                if "参数" in sym_show.columns:
+                                    sym_show["参数"] = sym_show["参数"].apply(
+                                        lambda x: json.dumps(x, ensure_ascii=False) if isinstance(x, dict) else x
+                                    )
+                                st.dataframe(sym_show, use_container_width=True, hide_index=True)
+                                _render_optimization_heatmap(
+                                    sym_ranking,
+                                    key_prefix=f"optuna_multi_{sym}",
+                                    selected_params=selected_opt_params_runtime,
+                                )
+                if bool(opt_run_wf):
+                    st.info("多币种模式暂不支持 Walk-Forward，本次已自动跳过。")
+            else:
+                with st.spinner("正在执行 Optuna 贝叶斯优化..."):
                     try:
-                        wf_df, wf_summary = run_walk_forward_optuna(
+                        opt_res = optimize_parameters_optuna(
                             df=df,
                             strategy_cls=strategy_cls,
                             param_schema=optuna_param_schema,
@@ -2583,20 +3589,113 @@ if product_mode == "backtest" and (run_btn or optimize_btn):
                             leverage=float(leverage),
                             position_sizing_mode=str(position_sizing_mode),
                             fixed_trade_amount=float(effective_fixed_trade_amount),
-                            objective=opt_objective,
-                            folds=int(opt_folds),
+                            objective=objective_runtime,
+                            score_func=score_func_runtime,
                             n_trials=int(opt_trials),
                             sampler_name=str(opt_sampler),
                             seed=int(opt_seed),
                             n_jobs=int(effective_workers),
                         )
                     except Exception as exc:  # noqa: BLE001
-                        st.error(f"Walk-Forward（Optuna）失败：{exc}")
+                        st.error(f"Optuna 优化失败：{exc}")
                         st.stop()
-            else:
-                st.info("已按设置跳过 Walk-Forward，仅执行参数优化。")
 
-        if bool(opt_run_wf):
+                if opt_res.ranking.empty or not opt_res.best_params:
+                    st.warning("Optuna 未找到有效参数")
+                    st.stop()
+
+                st.success("Optuna 优化完成")
+                st.write("最优参数：")
+                st.json(opt_res.best_params)
+                st.session_state["last_optimized_params"] = dict(opt_res.best_params)
+                st.session_state["last_optimized_strategy_file"] = str(st.session_state.get("strategy_file_name", ""))
+                st.session_state["_last_opt_ranking"] = opt_res.ranking
+                st.session_state["_last_opt_method"] = "Optuna(贝叶斯)"
+                st.session_state["_last_opt_selected_params"] = list(selected_opt_params_runtime)
+                st.session_state["_last_opt_strategy_file"] = str(st.session_state.get("strategy_file_name", ""))
+
+                best_score_candidate = None
+                if opt_res.best_score is not None:
+                    try:
+                        score_val = float(opt_res.best_score)
+                        if math.isfinite(score_val):
+                            best_score_candidate = score_val
+                    except Exception:  # noqa: BLE001
+                        best_score_candidate = None
+                if best_score_candidate is None and "评分" in opt_res.ranking.columns and not opt_res.ranking.empty:
+                    score_ser = pd.to_numeric(pd.Series([opt_res.ranking.iloc[0]["评分"]]), errors="coerce")
+                    if not score_ser.empty and pd.notna(score_ser.iloc[0]):
+                        best_score_candidate = float(score_ser.iloc[0])
+                try:
+                    opt_run_id, opt_detail_path, _opt_ranking_path, _opt_log_path = _save_optimization_record(
+                        method="Optuna(贝叶斯)",
+                        objective=str(opt_objective),
+                        symbol=symbol,
+                        interval=interval,
+                        selected_start_date=start_date,
+                        selected_end_date=end_date,
+                        strategy_display_name=strategy_display_name,
+                        strategy_params=strategy_params,
+                        selected_opt_params=selected_opt_params_runtime,
+                        is_multi_symbol=False,
+                        symbols=[symbol],
+                        best_symbol=symbol,
+                        best_params=opt_res.best_params,
+                        best_score=best_score_candidate,
+                        ranking_df=opt_res.ranking,
+                        opt_config={
+                            "opt_method": "Optuna(贝叶斯)",
+                            "opt_trials": int(opt_trials),
+                            "opt_sampler": str(opt_sampler),
+                            "opt_seed": int(opt_seed),
+                            "workers": int(effective_workers),
+                            "custom_score_expr": str(st.session_state.get("opt_custom_score_expr", "")),
+                        },
+                    )
+                    st.caption(f"已自动保存优化结果：{opt_run_id}（{opt_detail_path.name}）")
+                except Exception as exc:  # noqa: BLE001
+                    st.warning(f"自动保存优化结果失败：{exc}")
+
+                st.caption(f"最优评分：{opt_res.best_score}")
+
+                topn = min(30, len(opt_res.ranking))
+                ranking_show = opt_res.ranking.head(topn).copy()
+                ranking_show["参数"] = ranking_show["参数"].apply(lambda x: json.dumps(x, ensure_ascii=False))
+                st.dataframe(ranking_show, use_container_width=True, hide_index=True)
+                _render_optimization_heatmap(
+                    opt_res.ranking,
+                    key_prefix="optuna",
+                    selected_params=selected_opt_params_runtime,
+                )
+
+                if bool(opt_run_wf):
+                    with st.spinner("正在执行 Walk-Forward（Optuna）..."):
+                        try:
+                            wf_df, wf_summary = run_walk_forward_optuna(
+                                df=df,
+                                strategy_cls=strategy_cls,
+                                param_schema=optuna_param_schema,
+                                initial_cash=float(initial_cash),
+                                commission=float(commission),
+                                position_percent=float(position_percent),
+                                leverage=float(leverage),
+                                position_sizing_mode=str(position_sizing_mode),
+                                fixed_trade_amount=float(effective_fixed_trade_amount),
+                                objective=objective_runtime,
+                                score_func=score_func_runtime,
+                                folds=int(opt_folds),
+                                n_trials=int(opt_trials),
+                                sampler_name=str(opt_sampler),
+                                seed=int(opt_seed),
+                                n_jobs=int(effective_workers),
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            st.error(f"Walk-Forward（Optuna）失败：{exc}")
+                            st.stop()
+                else:
+                    st.info("已按设置跳过 Walk-Forward，仅执行参数优化。")
+
+        if bool(opt_run_wf) and not multi_symbol_mode_runtime:
             st.subheader("Walk-Forward 报告")
             c1, c2, c3 = st.columns(3)
             c1.metric("窗口数", wf_summary.get("folds"))
@@ -2636,6 +3735,10 @@ if product_mode == "backtest" and not (run_btn or optimize_btn):
         cached_show = cached_ranking.head(topn_cached).copy()
         if "参数" in cached_show.columns:
             cached_show["参数"] = cached_show["参数"].apply(lambda x: json.dumps(x, ensure_ascii=False))
+        if "最优参数" in cached_show.columns:
+            cached_show["最优参数"] = cached_show["最优参数"].apply(
+                lambda x: json.dumps(x, ensure_ascii=False) if isinstance(x, dict) else x
+            )
         st.dataframe(cached_show, use_container_width=True, hide_index=True)
 
         cached_selected = st.session_state.get("_last_opt_selected_params", [])

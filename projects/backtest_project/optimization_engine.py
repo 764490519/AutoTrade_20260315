@@ -3,9 +3,10 @@
 import itertools
 import json
 import os
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+import threading
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, ThreadPoolExecutor, as_completed, wait
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 import pandas as pd
 
@@ -37,6 +38,19 @@ class OptunaSearchResult:
     ranking: pd.DataFrame
 
 
+@dataclass
+class MultiSymbolOptimizationResult:
+    """多币种优化结果（统一排序）。"""
+
+    ranking: pd.DataFrame
+    per_symbol: dict[str, dict[str, Any]]
+    best_symbol: str | None
+    objective: str
+
+
+ScoreFunc = Callable[[dict[str, Any], str, dict[str, Any]], float]
+
+
 def _normalize_n_jobs(n_jobs: int | None) -> int:
     cpu = os.cpu_count() or 1
     if n_jobs is None:
@@ -54,6 +68,19 @@ def _dedupe_keep_order(values: list[Any]) -> list[Any]:
         if value not in out:
             out.append(value)
     return out
+
+
+def _estimate_effective_grid_evals(param_grid: dict[str, list[Any]], max_combinations: int) -> int:
+    """估算单币种网格优化实际评估次数（受 max_combinations 限制）。"""
+    cap = max(1, int(max_combinations))
+    total = 1
+    if not param_grid:
+        return 1
+    for values in param_grid.values():
+        total *= max(1, len(values))
+        if total >= cap:
+            return cap
+    return max(1, int(total))
 
 
 def build_auto_param_grid(
@@ -138,11 +165,66 @@ def _iter_param_combinations(param_grid: dict[str, list[Any]]):
         yield dict(zip(keys, values, strict=False))
 
 
-def _calc_score(metrics: dict[str, Any], objective: str) -> float:
-    value = metrics.get(objective)
+def _safe_float(value: Any) -> float | None:
+    try:
+        if value is None:
+            return None
+        out = float(value)
+        if pd.isna(out):
+            return None
+        return out
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _return_drawdown_ratio(metrics: dict[str, Any]) -> float | None:
+    ann = _safe_float(metrics.get("年化收益率(%)"))
+    mdd = _safe_float(metrics.get("最大回撤(%)"))
+    if ann is None or mdd is None:
+        return None
+    mdd_abs = abs(mdd)
+    if mdd_abs <= 1e-12:
+        return None
+    return ann / mdd_abs
+
+
+def _objective_label(objective: Any, score_func: ScoreFunc | None = None) -> str:
+    if callable(score_func):
+        return "自定义评分函数(score_func)"
+    if callable(objective):
+        return f"自定义目标({getattr(objective, '__name__', 'callable')})"
+    return str(objective or "Sharpe")
+
+
+def _calc_score(
+    metrics: dict[str, Any],
+    objective: Any,
+    *,
+    score_func: ScoreFunc | None = None,
+    symbol: str = "",
+    params: dict[str, Any] | None = None,
+) -> float:
+    if callable(score_func):
+        try:
+            return float(score_func(metrics, symbol, dict(params or {})))
+        except Exception:  # noqa: BLE001
+            return BAD_SCORE
+
+    if callable(objective):
+        try:
+            return float(objective(metrics))
+        except Exception:  # noqa: BLE001
+            return BAD_SCORE
+
+    objective_text = str(objective or "Sharpe")
+    if objective_text in {"收益回撤比", "年化收益回撤比", "return_drawdown_ratio", "calmar_like"}:
+        ratio = _return_drawdown_ratio(metrics)
+        return BAD_SCORE if ratio is None else float(ratio)
+
+    value = metrics.get(objective_text)
     if value is None:
         # 在较短窗口中 Sharpe 可能为 None，回退到总收益率避免全部参数并列 -inf
-        if objective == "Sharpe":
+        if objective_text == "Sharpe":
             fallback = metrics.get("总收益率(%)")
             if fallback is None:
                 return BAD_SCORE
@@ -154,20 +236,30 @@ def _calc_score(metrics: dict[str, Any], objective: str) -> float:
     try:
         numeric_value = float(value)
         # 最大回撤是“越小越好”，统一转为“越大越好”的评分
-        if objective == "最大回撤(%)":
+        if objective_text == "最大回撤(%)":
             return -abs(numeric_value)
         return numeric_value
     except Exception:  # noqa: BLE001
         return BAD_SCORE
 
 
-def _build_success_row(params: dict[str, Any], metrics: dict[str, Any], objective: str) -> dict[str, Any]:
+def _build_success_row(
+    params: dict[str, Any],
+    metrics: dict[str, Any],
+    objective: Any,
+    *,
+    score_func: ScoreFunc | None = None,
+    symbol: str = "",
+) -> dict[str, Any]:
     return {
         "参数": params,
-        "评分": _calc_score(metrics, objective),
+        "评分": _calc_score(metrics, objective, score_func=score_func, symbol=symbol, params=params),
         "总收益率(%)": metrics.get("总收益率(%)"),
+        "年化收益率(%)": metrics.get("年化收益率(%)"),
         "Sharpe": metrics.get("Sharpe"),
         "最大回撤(%)": metrics.get("最大回撤(%)"),
+        "胜率(%)": metrics.get("胜率(%)"),
+        "收益回撤比": _return_drawdown_ratio(metrics),
         "总交易次数": metrics.get("总交易次数"),
     }
 
@@ -195,7 +287,9 @@ def _eval_one_local(
     leverage: float,
     position_sizing_mode: str,
     fixed_trade_amount: float | None,
-    objective: str,
+    objective: Any,
+    score_func: ScoreFunc | None = None,
+    symbol: str = "",
 ) -> dict[str, Any]:
     try:
         result: BacktestResult = run_backtest(
@@ -210,7 +304,13 @@ def _eval_one_local(
             position_sizing_mode=position_sizing_mode,
             fixed_trade_amount=fixed_trade_amount,
         )
-        return _build_success_row(params, result.metrics, objective)
+        return _build_success_row(
+            params,
+            result.metrics,
+            objective,
+            score_func=score_func,
+            symbol=symbol,
+        )
     except Exception as exc:  # noqa: BLE001
         return _build_error_row(params, exc)
 
@@ -242,7 +342,7 @@ def _mp_eval_one(
     leverage: float,
     position_sizing_mode: str,
     fixed_trade_amount: float | None,
-    objective: str,
+    objective: Any,
 ) -> dict[str, Any]:
     global _MP_DF, _MP_STRATEGY_CLS
     if _MP_DF is None or _MP_STRATEGY_CLS is None:
@@ -272,7 +372,8 @@ def optimize_parameters(
     leverage: float = 1.0,
     position_sizing_mode: str = "percent_equity",
     fixed_trade_amount: float | None = None,
-    objective: str = "Sharpe",
+    objective: Any = "Sharpe",
+    score_func: ScoreFunc | None = None,
     max_combinations: int = 80,
     n_jobs: int = 1,
     progress_callback: Any | None = None,
@@ -287,6 +388,8 @@ def optimize_parameters(
         return GridSearchResult(best_params={}, ranking=pd.DataFrame())
 
     n_jobs = _normalize_n_jobs(n_jobs)
+
+    has_custom_scoring = callable(score_func) or callable(objective)
 
     if n_jobs <= 1 or len(combos) <= 1:
         total = len(combos)
@@ -303,6 +406,7 @@ def optimize_parameters(
                     position_sizing_mode=position_sizing_mode,
                     fixed_trade_amount=fixed_trade_amount,
                     objective=objective,
+                    score_func=score_func,
                 )
             )
             if callable(progress_callback):
@@ -313,7 +417,7 @@ def optimize_parameters(
     else:
         total = len(combos)
         done = 0
-        use_process_pool = bool(strategy_code)
+        use_process_pool = bool(strategy_code) and (not has_custom_scoring)
         if use_process_pool:
             try:
                 with ProcessPoolExecutor(
@@ -331,7 +435,7 @@ def optimize_parameters(
                             float(leverage),
                             str(position_sizing_mode),
                             None if fixed_trade_amount is None else float(fixed_trade_amount),
-                            str(objective),
+                            objective,
                         ): params
                         for params in combos
                     }
@@ -366,6 +470,7 @@ def optimize_parameters(
                         position_sizing_mode=position_sizing_mode,
                         fixed_trade_amount=fixed_trade_amount,
                         objective=objective,
+                        score_func=score_func,
                     ): params
                     for params in combos
                 }
@@ -401,7 +506,8 @@ def run_walk_forward(
     leverage: float = 1.0,
     position_sizing_mode: str = "percent_equity",
     fixed_trade_amount: float | None = None,
-    objective: str = "Sharpe",
+    objective: Any = "Sharpe",
+    score_func: ScoreFunc | None = None,
     folds: int = 4,
     max_combinations: int = 80,
     n_jobs: int = 1,
@@ -442,6 +548,7 @@ def run_walk_forward(
                 position_sizing_mode=position_sizing_mode,
                 fixed_trade_amount=fixed_trade_amount,
                 objective=objective,
+                score_func=score_func,
                 max_combinations=max_combinations,
                 n_jobs=n_jobs,
                 strategy_code=strategy_code,
@@ -605,7 +712,8 @@ def optimize_parameters_optuna(
     leverage: float = 1.0,
     position_sizing_mode: str = "percent_equity",
     fixed_trade_amount: float | None = None,
-    objective: str = "Sharpe",
+    objective: Any = "Sharpe",
+    score_func: ScoreFunc | None = None,
     n_trials: int = 80,
     sampler_name: str = "TPE",
     seed: int | None = 42,
@@ -644,7 +752,7 @@ def optimize_parameters_optuna(
             )
 
             metrics = result.metrics
-            score = _calc_score(metrics, objective)
+            score = _calc_score(metrics, objective, score_func=score_func, params=params)
             trial.set_user_attr("params", params)
             trial.set_user_attr("总收益率(%)", metrics.get("总收益率(%)"))
             trial.set_user_attr("Sharpe", metrics.get("Sharpe"))
@@ -719,7 +827,8 @@ def run_walk_forward_optuna(
     leverage: float = 1.0,
     position_sizing_mode: str = "percent_equity",
     fixed_trade_amount: float | None = None,
-    objective: str = "Sharpe",
+    objective: Any = "Sharpe",
+    score_func: ScoreFunc | None = None,
     folds: int = 4,
     n_trials: int = 80,
     sampler_name: str = "TPE",
@@ -760,6 +869,7 @@ def run_walk_forward_optuna(
                 position_sizing_mode=position_sizing_mode,
                 fixed_trade_amount=fixed_trade_amount,
                 objective=objective,
+                score_func=score_func,
                 n_trials=n_trials,
                 sampler_name=sampler_name,
                 seed=None if seed is None else int(seed) + i,
@@ -858,3 +968,381 @@ def run_walk_forward_optuna(
     }
 
     return wf_df, summary
+
+
+def _symbol_result_row(
+    *,
+    symbol: str,
+    best_params: dict[str, Any],
+    metrics: dict[str, Any] | None,
+    objective: Any,
+    score_func: ScoreFunc | None,
+    error: str | None,
+) -> dict[str, Any]:
+    safe_metrics = dict(metrics or {})
+    score = BAD_SCORE if error else _calc_score(
+        safe_metrics,
+        objective,
+        score_func=score_func,
+        symbol=symbol,
+        params=best_params,
+    )
+    return {
+        "币种": symbol,
+        "评分": float(score),
+        "优化目标": _objective_label(objective, score_func),
+        "最优参数": dict(best_params or {}),
+        "总收益率(%)": safe_metrics.get("总收益率(%)"),
+        "年化收益率(%)": safe_metrics.get("年化收益率(%)"),
+        "Sharpe": safe_metrics.get("Sharpe"),
+        "最大回撤(%)": safe_metrics.get("最大回撤(%)"),
+        "胜率(%)": safe_metrics.get("胜率(%)"),
+        "收益回撤比": _return_drawdown_ratio(safe_metrics),
+        "总交易次数": safe_metrics.get("总交易次数"),
+        "错误": error,
+    }
+
+
+def _sort_multi_symbol_ranking(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    out = df.copy()
+    out["__has_error"] = out["错误"].notna()
+    out["__score_num"] = pd.to_numeric(out["评分"], errors="coerce").fillna(BAD_SCORE)
+    out = out.sort_values(by=["__has_error", "__score_num"], ascending=[True, False], na_position="last")
+    return out.drop(columns=["__has_error", "__score_num"]).reset_index(drop=True)
+
+
+def optimize_parameters_multi_symbol(
+    symbol_data_map: dict[str, pd.DataFrame],
+    strategy_cls,
+    param_grid: dict[str, list[Any]],
+    initial_cash: float,
+    commission: float,
+    position_percent: float,
+    leverage: float = 1.0,
+    position_sizing_mode: str = "percent_equity",
+    fixed_trade_amount: float | None = None,
+    objective: Any = "Sharpe",
+    score_func: ScoreFunc | None = None,
+    max_combinations: int = 80,
+    n_jobs: int = 1,
+    symbol_n_jobs: int = 1,
+    progress_callback: Any | None = None,
+    strategy_code: str | None = None,
+    strategy_class_name: str | None = None,
+) -> MultiSymbolOptimizationResult:
+    """
+    多币种批量网格优化：
+    - 每个币种独立优化，得到该币种最优参数
+    - 对最优结果进行统一指标汇总并按目标评分排序
+    """
+    if not symbol_data_map:
+        return MultiSymbolOptimizationResult(
+            ranking=pd.DataFrame(),
+            per_symbol={},
+            best_symbol=None,
+            objective=_objective_label(objective, score_func),
+        )
+
+    symbol_n_jobs = _normalize_n_jobs(symbol_n_jobs)
+    symbol_items = [(str(sym), df) for sym, df in symbol_data_map.items()]
+    per_symbol_total_evals = _estimate_effective_grid_evals(param_grid=param_grid, max_combinations=max_combinations)
+    total_evals = max(1, int(per_symbol_total_evals) * max(1, len(symbol_items)))
+    _progress_lock = threading.Lock()
+    _symbol_done_map: dict[str, int] = {str(sym): 0 for sym, _ in symbol_items}
+
+    def _emit_multi_progress(symbol: str, done: int) -> None:
+        try:
+            done_i = int(done)
+        except Exception:  # noqa: BLE001
+            done_i = 0
+        done_i = max(0, min(done_i, int(per_symbol_total_evals)))
+        with _progress_lock:
+            prev = int(_symbol_done_map.get(symbol, 0))
+            if done_i < prev:
+                done_i = prev
+            _symbol_done_map[symbol] = done_i
+    
+    def _current_global_done() -> int:
+        with _progress_lock:
+            return int(sum(_symbol_done_map.values()))
+
+    def _flush_progress_to_callback() -> None:
+        if not callable(progress_callback):
+            return
+        try:
+            progress_callback(_current_global_done(), total_evals)
+        except Exception:  # noqa: BLE001
+            pass
+
+    if callable(progress_callback):
+        try:
+            progress_callback(0, total_evals)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _run_one_symbol(symbol: str, df: pd.DataFrame) -> tuple[str, dict[str, Any], dict[str, Any]]:
+        detail: dict[str, Any] = {
+            "symbol": symbol,
+            "best_params": {},
+            "metrics": None,
+            "score": BAD_SCORE,
+            "ranking": pd.DataFrame(),
+            "error": None,
+        }
+        def _on_one_symbol_progress(done: int, total: int) -> None:
+            _emit_multi_progress(symbol, done)
+        try:
+            gs = optimize_parameters(
+                df=df,
+                strategy_cls=strategy_cls,
+                param_grid=param_grid,
+                initial_cash=initial_cash,
+                commission=commission,
+                position_percent=position_percent,
+                leverage=leverage,
+                position_sizing_mode=position_sizing_mode,
+                fixed_trade_amount=fixed_trade_amount,
+                objective=objective,
+                score_func=score_func,
+                max_combinations=max_combinations,
+                n_jobs=n_jobs,
+                progress_callback=_on_one_symbol_progress,
+                strategy_code=strategy_code,
+                strategy_class_name=strategy_class_name,
+            )
+            detail["ranking"] = gs.ranking
+            best_params = gs.best_params if isinstance(gs.best_params, dict) else {}
+            detail["best_params"] = dict(best_params)
+
+            if not best_params:
+                detail["error"] = "未找到有效参数"
+                row = _symbol_result_row(
+                    symbol=symbol,
+                    best_params={},
+                    metrics=None,
+                    objective=objective,
+                    score_func=score_func,
+                    error=detail["error"],
+                )
+                return symbol, row, detail
+
+            bt_res = run_backtest(
+                df=df,
+                strategy_cls=strategy_cls,
+                strategy_params=best_params,
+                initial_cash=initial_cash,
+                commission=commission,
+                position_percent=position_percent,
+                leverage=leverage,
+                include_details=False,
+                position_sizing_mode=position_sizing_mode,
+                fixed_trade_amount=fixed_trade_amount,
+            )
+            metrics = dict(bt_res.metrics or {})
+            detail["metrics"] = metrics
+            detail["score"] = _calc_score(metrics, objective, score_func=score_func, symbol=symbol, params=best_params)
+            row = _symbol_result_row(
+                symbol=symbol,
+                best_params=best_params,
+                metrics=metrics,
+                objective=objective,
+                score_func=score_func,
+                error=None,
+            )
+            return symbol, row, detail
+        except Exception as exc:  # noqa: BLE001
+            detail["error"] = str(exc)
+            row = _symbol_result_row(
+                symbol=symbol,
+                best_params=detail.get("best_params") or {},
+                metrics=None,
+                objective=objective,
+                score_func=score_func,
+                error=str(exc),
+            )
+            return symbol, row, detail
+        finally:
+            _emit_multi_progress(symbol, int(per_symbol_total_evals))
+
+    rows: list[dict[str, Any]] = []
+    per_symbol: dict[str, dict[str, Any]] = {}
+
+    if symbol_n_jobs <= 1 or len(symbol_items) <= 1:
+        for symbol, df in symbol_items:
+            sym, row, detail = _run_one_symbol(symbol, df)
+            rows.append(row)
+            per_symbol[sym] = detail
+            _flush_progress_to_callback()
+    else:
+        with ThreadPoolExecutor(max_workers=symbol_n_jobs) as executor:
+            future_map = {executor.submit(_run_one_symbol, symbol, df): symbol for symbol, df in symbol_items}
+            pending_futures = set(future_map.keys())
+            while pending_futures:
+                done_set, pending_futures = wait(pending_futures, timeout=0.5, return_when=FIRST_COMPLETED)
+                _flush_progress_to_callback()
+                for future in done_set:
+                    sym, row, detail = future.result()
+                    rows.append(row)
+                    per_symbol[sym] = detail
+
+    _flush_progress_to_callback()
+
+    ranking = _sort_multi_symbol_ranking(pd.DataFrame(rows))
+    best_symbol: str | None = None
+    if not ranking.empty:
+        valid = ranking[ranking["错误"].isna()]
+        if not valid.empty:
+            best_symbol = str(valid.iloc[0]["币种"])
+
+    return MultiSymbolOptimizationResult(
+        ranking=ranking,
+        per_symbol=per_symbol,
+        best_symbol=best_symbol,
+        objective=_objective_label(objective, score_func),
+    )
+
+
+def optimize_parameters_optuna_multi_symbol(
+    symbol_data_map: dict[str, pd.DataFrame],
+    strategy_cls,
+    param_schema: dict[str, dict[str, Any]],
+    initial_cash: float,
+    commission: float,
+    position_percent: float,
+    leverage: float = 1.0,
+    position_sizing_mode: str = "percent_equity",
+    fixed_trade_amount: float | None = None,
+    objective: Any = "Sharpe",
+    score_func: ScoreFunc | None = None,
+    n_trials: int = 80,
+    sampler_name: str = "TPE",
+    seed: int | None = 42,
+    n_jobs: int = 1,
+    symbol_n_jobs: int = 1,
+) -> MultiSymbolOptimizationResult:
+    """多币种批量 Optuna 优化并统一排序。"""
+    if not symbol_data_map:
+        return MultiSymbolOptimizationResult(
+            ranking=pd.DataFrame(),
+            per_symbol={},
+            best_symbol=None,
+            objective=_objective_label(objective, score_func),
+        )
+
+    symbol_n_jobs = _normalize_n_jobs(symbol_n_jobs)
+    symbol_items = [(str(sym), df) for sym, df in symbol_data_map.items()]
+
+    def _run_one_symbol(symbol: str, df: pd.DataFrame, symbol_idx: int) -> tuple[str, dict[str, Any], dict[str, Any]]:
+        detail: dict[str, Any] = {
+            "symbol": symbol,
+            "best_params": {},
+            "metrics": None,
+            "score": BAD_SCORE,
+            "ranking": pd.DataFrame(),
+            "error": None,
+        }
+        symbol_seed = None if seed is None else int(seed) + int(symbol_idx)
+        try:
+            opt_res = optimize_parameters_optuna(
+                df=df,
+                strategy_cls=strategy_cls,
+                param_schema=param_schema,
+                initial_cash=initial_cash,
+                commission=commission,
+                position_percent=position_percent,
+                leverage=leverage,
+                position_sizing_mode=position_sizing_mode,
+                fixed_trade_amount=fixed_trade_amount,
+                objective=objective,
+                score_func=score_func,
+                n_trials=n_trials,
+                sampler_name=sampler_name,
+                seed=symbol_seed,
+                n_jobs=n_jobs,
+            )
+            detail["ranking"] = opt_res.ranking
+            best_params = opt_res.best_params if isinstance(opt_res.best_params, dict) else {}
+            detail["best_params"] = dict(best_params)
+
+            if not best_params:
+                detail["error"] = "未找到有效参数"
+                row = _symbol_result_row(
+                    symbol=symbol,
+                    best_params={},
+                    metrics=None,
+                    objective=objective,
+                    score_func=score_func,
+                    error=detail["error"],
+                )
+                return symbol, row, detail
+
+            bt_res = run_backtest(
+                df=df,
+                strategy_cls=strategy_cls,
+                strategy_params=best_params,
+                initial_cash=initial_cash,
+                commission=commission,
+                position_percent=position_percent,
+                leverage=leverage,
+                include_details=False,
+                position_sizing_mode=position_sizing_mode,
+                fixed_trade_amount=fixed_trade_amount,
+            )
+            metrics = dict(bt_res.metrics or {})
+            detail["metrics"] = metrics
+            detail["score"] = _calc_score(metrics, objective, score_func=score_func, symbol=symbol, params=best_params)
+            row = _symbol_result_row(
+                symbol=symbol,
+                best_params=best_params,
+                metrics=metrics,
+                objective=objective,
+                score_func=score_func,
+                error=None,
+            )
+            return symbol, row, detail
+        except Exception as exc:  # noqa: BLE001
+            detail["error"] = str(exc)
+            row = _symbol_result_row(
+                symbol=symbol,
+                best_params=detail.get("best_params") or {},
+                metrics=None,
+                objective=objective,
+                score_func=score_func,
+                error=str(exc),
+            )
+            return symbol, row, detail
+
+    rows: list[dict[str, Any]] = []
+    per_symbol: dict[str, dict[str, Any]] = {}
+
+    if symbol_n_jobs <= 1 or len(symbol_items) <= 1:
+        for idx, (symbol, df) in enumerate(symbol_items):
+            sym, row, detail = _run_one_symbol(symbol, df, idx)
+            rows.append(row)
+            per_symbol[sym] = detail
+    else:
+        with ThreadPoolExecutor(max_workers=symbol_n_jobs) as executor:
+            future_map = {
+                executor.submit(_run_one_symbol, symbol, df, idx): symbol
+                for idx, (symbol, df) in enumerate(symbol_items)
+            }
+            for future in as_completed(future_map):
+                sym, row, detail = future.result()
+                rows.append(row)
+                per_symbol[sym] = detail
+
+    ranking = _sort_multi_symbol_ranking(pd.DataFrame(rows))
+    best_symbol: str | None = None
+    if not ranking.empty:
+        valid = ranking[ranking["错误"].isna()]
+        if not valid.empty:
+            best_symbol = str(valid.iloc[0]["币种"])
+
+    return MultiSymbolOptimizationResult(
+        ranking=ranking,
+        per_symbol=per_symbol,
+        best_symbol=best_symbol,
+        objective=_objective_label(objective, score_func),
+    )
